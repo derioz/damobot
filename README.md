@@ -7,7 +7,7 @@
 <h1 align="center">DamoBot</h1>
 
 <p align="center">
-  <strong>The Ultimate High-Performance Discord Bot Specially Engineered for <a href="https://vitalrp.co.uk">Vital RP</a></strong><br>
+  <strong>The Ultimate High-Performance Discord Bot Specially Engineered for <a href="http://vitalrp.net">Vital RP</a></strong><br>
   <em>Built on Cloudflare Workers Serverless Edge, SQLite Durable Objects, and Discord Components V2</em>
 </p>
 
@@ -23,7 +23,7 @@
 
 ## 📖 About DamoBot & Vital RP
 
-**DamoBot** is the bespoke operations bot that powers the day-to-day community and staff workflows for **[Vital RP](https://vitalrp.co.uk)** — one of FiveM's premier British roleplay servers.
+**DamoBot** is the bespoke operations bot that powers the day-to-day community and staff workflows for **[Vital RP](http://vitalrp.net)** — one of FiveM's premier British roleplay servers.
 
 From processing staff Leave of Absence (LOA) requests and managing multi-layer disciplinary audits to orchestrating player compensation logs, community suggestions, and instant sticky channel notices, DamoBot handles it all with zero-cold-start edge latency.
 
@@ -183,6 +183,6 @@ DamoBot enforces strict role-based access control (RBAC). Core permissions are v
 ---
 
 <p align="center">
-  <strong>Crafted with ❤️ for the <a href="https://vitalrp.co.uk">Vital RP</a> Community</strong><br>
+  <strong>Crafted with ❤️ for the <a href="http://vitalrp.net">Vital RP</a> Community</strong><br>
   <sub>Maintained by the Vital RP Development Team</sub>
 </p>
