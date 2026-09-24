@@ -39,7 +39,7 @@ function loadEnvFile(filePath) {
 loadEnvFile(".dev.vars");
 loadEnvFile(".env");
 
-const DEFAULT_BANNER_URL = "https://r2.fivemanage.com/image/jCJbGSok909D.png";
+const DEFAULT_BANNER_URL = "https://r2.fivemanage.com/image/4sIiNuE1Vmvn.png";
 const bannerUrl = process.argv[2] || process.env.BANNER_IMAGE_URL || DEFAULT_BANNER_URL;
 const botToken = process.env.DISCORD_BOT_TOKEN;
 

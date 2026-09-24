@@ -5,10 +5,10 @@
 
 // Canonical application version (single source of truth for all Components V2 interfaces)
 // Note: Kept here directly for scripts/bump-version.js compatibility.
-export const DAMO_BOT_VERSION = "v0.9.80-beta";
+export const DAMO_BOT_VERSION = "v0.9.81-beta";
 
 // Re-export modular configuration domains
-export { VITAL_RP_LOGO_URL, VITAL_ORANGE } from "./config/brand.js";
+export { VITAL_RP_LOGO_URL, DAMO_BOT_LOGO_URL, VITAL_ORANGE } from "./config/brand.js";
 export {
   DEFAULT_STAFF_TEAM_ROLE_ID,
   DEFAULT_OWNER_ROLE_ID,

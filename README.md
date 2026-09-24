@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://r2.fivemanage.com/image/jCJbGSok909D.png" alt="DamoBot Logo" width="130" style="border-radius: 50%; box-shadow: 0 4px 12px rgba(0,0,0,0.3);" />
+  <img src="https://r2.fivemanage.com/image/4sIiNuE1Vmvn.png" alt="DamoBot Logo" width="130" style="border-radius: 50%; box-shadow: 0 4px 12px rgba(0,0,0,0.3);" />
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="https://r2.fivemanage.com/image/qlWrCeXTQdqx.png" alt="Vital RP Logo" width="130" />
 </p>
