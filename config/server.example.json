@@ -1,0 +1,37 @@
+{
+  "community": {
+    "name": "Your FiveM Roleplay Community",
+    "shortName": "YFC",
+    "websiteUrl": "https://example.com",
+    "logoUrl": "https://example.com/logo.png",
+    "brandColor": "#FAA200"
+  },
+  "fivem": {
+    "serverIp": "play.example.com",
+    "serverPort": 30120,
+    "framework": "qbcore",
+    "apiEndpoint": ""
+  },
+  "discord": {
+    "guildId": "YOUR_DISCORD_GUILD_ID",
+    "roles": {
+      "staffTeam": "YOUR_STAFF_TEAM_ROLE_ID",
+      "owner": "YOUR_OWNER_ROLE_ID",
+      "management": "YOUR_MANAGEMENT_ROLE_ID",
+      "staffLoa": "YOUR_STAFF_LOA_ROLE_ID",
+      "moderator": "YOUR_MODERATOR_ROLE_ID",
+      "support": "YOUR_SUPPORT_ROLE_ID"
+    },
+    "channels": {
+      "loaCenter": "YOUR_LOA_CENTER_CHANNEL_ID",
+      "loaLogs": "YOUR_LOA_LOGS_CHANNEL_ID",
+      "punishmentLogs": "YOUR_PUNISHMENT_LOGS_CHANNEL_ID",
+      "refundLogs": "YOUR_REFUND_LOGS_CHANNEL_ID",
+      "suggestions": "YOUR_SUGGESTIONS_CHANNEL_ID",
+      "ticketReminders": "YOUR_TICKET_REMINDERS_CHANNEL_ID"
+    },
+    "superadmins": [
+      "YOUR_DISCORD_USER_ID"
+    ]
+  }
+}

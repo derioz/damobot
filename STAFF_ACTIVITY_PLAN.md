@@ -6,20 +6,20 @@ Saved September 8, 2026 UTC (September 7 in America/Chicago). The user asked to 
 
 - Feasibility and Discord access have been checked. The tracker has NOT been implemented, registered, deployed, or started.
 - The user confirmed Damo Bot has Administrator permission in Vital RP. After the user enabled Message Content Intent, read-only API checks confirmed access to transcript embeds and HTML attachments.
-- Application ID: `1544164852132618382`; guild ID: `730015674348601384`. The local token's application matched the configured application ID. Do not store tokens or transcript contents in this document.
+- Application ID: `YOUR_APPLICATION_ID`; guild ID: `YOUR_GUILD_ID`.
 - The earlier repository audit was read-only. Separate deployment preferences were saved in AGENTS.md. Audit findings, particularly LOA role safety and recovery issues, remain unresolved.
 
 ## Agreed scope and sources
 
 Track support and refund tickets only. Exclude player reports and all other ticket types, even though their transcripts share the log channel.
 
-| Source | Discord ID | Verified name / transcript panel |
+| Source | Discord ID | Description |
 | --- | --- | --- |
-| Support category | `1285590272838729829` | `🎟〡Support Tickets`; panel `Support` |
-| Refund category | `1124767760933724170` | `🎟〡Refund Requests`; panel `Refund Requests` |
-| Shared transcript channel | `742878979639214122` | `🪵〡ticket-logs` |
-| Staff Team role | `743422836223246366` | User says staff always have this role |
-| Ticket Tool author observed | `557628352828014614` | Bot author of sampled transcript posts |
+| Support category | `YOUR_SUPPORT_CATEGORY_ID` | Support Tickets Category |
+| Refund category | `YOUR_REFUND_CATEGORY_ID` | Refund Requests Category |
+| Shared transcript channel | `YOUR_TRANSCRIPT_CHANNEL_ID` | Ticket Transcripts Channel |
+| Staff Team role | `YOUR_STAFF_TEAM_ROLE_ID` | Staff Team Role |
+| Ticket Tool author | `557628352828014614` | Ticket Tool Bot ID |
 
 Support and refund tickets are open to any staff member to help; claiming is not required. The player-report assignment/triage workflow discussed earlier is outside this feature's scope.
 

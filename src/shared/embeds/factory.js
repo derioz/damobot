@@ -7,6 +7,8 @@ import {
   VITAL_ORANGE,
   VITAL_RP_LOGO_URL,
   DAMO_BOT_VERSION,
+  getCommunityName,
+  getCommunityLogoUrl,
 } from "../../config/brand.js";
 
 export const EmbedColor = {
@@ -32,6 +34,7 @@ export const EmbedColor = {
  * @param {string|Object} [options.image]
  * @param {Object} [options.author]
  * @param {string} [options.url]
+ * @param {Object} [options.env] Cloudflare environment for community branding
  * @returns {Object} Discord Embed object
  */
 export function createDamoEmbed({
@@ -39,14 +42,20 @@ export function createDamoEmbed({
   description,
   color = EmbedColor.DEFAULT,
   fields = [],
-  footerText = `Damo-Bot ${DAMO_BOT_VERSION} • Vital RP`,
-  footerIconUrl = VITAL_RP_LOGO_URL,
+  footerText,
+  footerIconUrl,
   timestamp = new Date().toISOString(),
   thumbnail,
   image,
   author,
   url,
+  env,
 } = {}) {
+  const communityName = getCommunityName(env);
+  const resolvedFooterText =
+    footerText ?? `Damo-Bot ${DAMO_BOT_VERSION} • ${communityName}`;
+  const resolvedFooterIcon = footerIconUrl ?? getCommunityLogoUrl(env);
+
   const embed = {
     color,
     timestamp: timestamp instanceof Date ? timestamp.toISOString() : timestamp,
@@ -60,10 +69,10 @@ export function createDamoEmbed({
     embed.fields = fields.filter((f) => f && f.name && f.value !== undefined);
   }
 
-  if (footerText) {
+  if (resolvedFooterText) {
     embed.footer = {
-      text: footerText,
-      icon_url: footerIconUrl,
+      text: resolvedFooterText,
+      icon_url: resolvedFooterIcon,
     };
   }
 

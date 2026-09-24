@@ -1,8 +1,43 @@
+# Dependencies
 node_modules/
+
+# Cloudflare & Wrangler local state
 .wrangler/
 .dev.vars
+.dev.vars.*
+wrangler.jsonc
+!wrangler.example.jsonc
+
+# Environment variable files
+.env
+.env.*
+!.env.example
+
+# Local server & module configurations (keep examples tracked)
+config/server.json
+config/modules.json
+!config/server.example.json
+!config/modules.example.json
+
+# Build outputs & caches
 dist/
+build/
+coverage/
+*.lcov
+
+# Temporary & scratch files
 scratch/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System & OS junk
 .DS_Store
 Thumbs.db
 
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

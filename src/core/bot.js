@@ -7,11 +7,21 @@
 import { verifyKey } from "discord-interactions";
 import { dispatchInteraction } from "./router/dispatch.js";
 import { registry } from "./module-registry/index.js";
-import { validateBotConfig } from "../config/validate.js";
+import { validateBotConfig, validateEnvironment } from "../config/validate.js";
+import { DAMO_BOT_VERSION } from "../config.js";
 import { handleAdminChatMessage } from "../modules/admin-chat/mentionHandler.js";
 
 // Validate bot configuration on startup
 validateBotConfig();
+
+let _hasValidatedEnv = false;
+
+function ensureEnvironmentValidated(env) {
+  if (!_hasValidatedEnv && env) {
+    validateEnvironment(env);
+    _hasValidatedEnv = true;
+  }
+}
 
 export const DamoBotCore = {
   /**
@@ -19,6 +29,7 @@ export const DamoBotCore = {
    * Dispatches cron events to all registered modules that define a scheduled handler.
    */
   async handleScheduled(event, env, ctx) {
+    ensureEnvironmentValidated(env);
     const tasks = registry.getScheduledTasks();
     const promises = tasks.map(({ module: mod, scheduled }) =>
       (async () => {
@@ -40,9 +51,36 @@ export const DamoBotCore = {
    * HTTP request handler for Discord interactions and health checks.
    */
   async handleFetch(request, env, ctx) {
+    ensureEnvironmentValidated(env);
     const url = new URL(request.url);
 
-    // Health check endpoint
+    // Dedicated JSON health check endpoint with environment validation
+    if (request.method === "GET" && url.pathname === "/health") {
+      const validation = validateEnvironment(env, { silent: true });
+      return new Response(
+        JSON.stringify(
+          {
+            status: "healthy",
+            bot: "DamoBot",
+            version: DAMO_BOT_VERSION,
+            environment: {
+              valid: validation.valid,
+              errors: validation.errors,
+              warnings: validation.warnings,
+            },
+          },
+          null,
+          2
+        ),
+        {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+          },
+        }
+      );
+    }
+
+    // Health check endpoint (plain text, backward-compatible)
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("Damo Bot is running!", {
         headers: {

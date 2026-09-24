@@ -1,0 +1,40 @@
+{
+  "modules": {
+    "loa": {
+      "enabled": true,
+      "description": "Staff Leave of Absence Center"
+    },
+    "punishments": {
+      "enabled": true,
+      "description": "Punishment Center & Disciplinary Logs"
+    },
+    "refunds": {
+      "enabled": true,
+      "description": "Player Compensation & Asset Refund Center"
+    },
+    "suggestions": {
+      "enabled": true,
+      "description": "Community Suggestions & Voting System"
+    },
+    "reminders": {
+      "enabled": false,
+      "description": "Support Ticket Reminders with Thread Guard"
+    },
+    "referrals": {
+      "enabled": true,
+      "description": "Player Referral Codes & Rewards Tracking"
+    },
+    "stickies": {
+      "enabled": true,
+      "description": "Persistent Channel Sticky Messages"
+    },
+    "overview": {
+      "enabled": true,
+      "description": "Bot Health & Module Diagnostics (/damobot, /ping)"
+    },
+    "admin-chat": {
+      "enabled": true,
+      "description": "Admin Chat Webhook & Mention Bridge"
+    }
+  }
+}
