@@ -1,0 +1,34 @@
+# Discord Application Public Key (Discord Developer Portal -> General Information -> Public Key)
+DISCORD_PUBLIC_KEY="your_discord_public_key_here"
+
+# Discord Application ID (Discord Developer Portal -> General Information -> Application ID)
+DISCORD_APPLICATION_ID="your_discord_application_id_here"
+
+# Discord Bot Token (Discord Developer Portal -> Bot -> Token)
+DISCORD_BOT_TOKEN="your_discord_bot_token_here"
+
+# Discord Test Server Guild ID (Discord App -> Right click your server -> Copy Server ID)
+DISCORD_GUILD_ID="your_discord_guild_id_here"
+
+# Google Sheets Configuration
+GOOGLE_SERVICE_ACCOUNT_EMAIL="your-service-account@your-project.iam.gserviceaccount.com"
+GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nyour_google_private_key_here\n-----END PRIVATE KEY-----\n"
+GOOGLE_SHEET_ID="your_google_sheet_id_here"
+GOOGLE_SHEET_TAB="Referral Tracker"
+
+# Staff Role Configuration
+STAFF_TEAM_ROLE_ID="your_staff_team_role_id_here"
+OWNER_ROLE_ID="your_owner_role_id_here"
+LOA_CHANNEL_ID="your_loa_channel_id_here"
+
+# Staff Punishment Center Configuration
+PUNISHMENT_LOG_CHANNEL_ID="your_punishment_log_channel_id_here"
+PUNISHMENT_SHEET_ID="your_punishment_sheet_id_here"
+PUNISHMENT_SHEET_TAB="Punishment Logs"
+PUNISHMENT_AUDIT_TAB="Punishment Audits"
+
+# Staff Refund Center Configuration
+REFUND_LOG_CHANNEL_ID="your_refund_log_channel_id_here"
+REFUND_SHEET_ID="your_refund_sheet_id_here"
+REFUND_SHEET_TAB="Refund Log"
+REFUND_AUDIT_TAB="Refund Audits"

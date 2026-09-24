@@ -1,0 +1,26 @@
+{
+  "name": "damo-bot",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:live": "node scripts/bump-version.js && npm test && wrangler deploy",
+    "version:bump": "node scripts/bump-version.js",
+    "test": "node --import ./scripts/test-setup.js --test",
+    "register:commands": "node scripts/register-commands.js",
+    "register:guild": "node scripts/register-commands.js",
+    "setup:punishments-sheet": "node scripts/setup-punishment-sheet.js",
+    "migrate:punishments-d1": "node scripts/migrate-sheets-to-d1.js",
+    "migrate:refunds-d1": "node scripts/migrate-refunds-to-d1.js",
+    "set:banner": "node scripts/set-banner.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  },
+  "dependencies": {
+    "discord-interactions": "^4.4.0"
+  }
+}

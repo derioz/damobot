@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+scratch/
+.DS_Store
+Thumbs.db
+

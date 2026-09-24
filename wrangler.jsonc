@@ -1,0 +1,97 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "damo-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-28",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "DISCORD_APPLICATION_ID": "1544164852132618382",
+    "STAFF_TEAM_ROLE_ID": "743422836223246366",
+    "OWNER_ROLE_ID": "743423786275307542",
+    "VRP_MANAGEMENT_ROLE_ID": "738193447017513002",
+    "STAFF_LOA_ROLE_ID": "1546696583976980541",
+    "LOA_CHANNEL_ID": "1546281163247722516",
+    "LOA_LOG_CHANNEL_ID": "1546698584613715998",
+    "DISCORD_GUILD_ID": "730015674348601384",
+    "PUNISHMENT_LOG_CHANNEL_ID": "1249517344099668078",
+    "PUNISHMENT_SHEET_ID": "1CxMo8nLs_Ln6siVPOk4oqSwjgQr3E0GzKdZZHPVbvm0",
+    "PUNISHMENT_SHEET_TAB": "Punishment Logs",
+    "PUNISHMENT_AUDIT_TAB": "Punishment Audits",
+    "REFUND_LOG_CHANNEL_ID": "1289638609535766631",
+    "REFUND_SHEET_ID": "1CxMo8nLs_Ln6siVPOk4oqSwjgQr3E0GzKdZZHPVbvm0",
+    "REFUND_SHEET_TAB": "Refund Log",
+    "REFUND_AUDIT_TAB": "Refund Audits",
+    "SUGGESTIONS_CHANNEL_ID": "1446287220389712024",
+    "TICKET_REMINDER_CHANNEL_ID": "1220039518279827528",
+    "SUPPORT_STAFF_ROLE_ID": "733091380540473384",
+    "MODERATOR_ROLE_ID": "733091376832708689",
+    "REMINDERS_ENABLED": "false"
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "PUNISHMENT_DB",
+      "database_name": "damo-bot-punishments",
+      "database_id": "67a07694-a5c1-4b67-9edc-13ccf222a00f",
+      "migrations_dir": "migrations"
+    },
+    {
+      "binding": "REFUND_DB",
+      "database_name": "damo-bot-refunds",
+      "database_id": "6b4937b8-9193-45cf-afa1-b73e109b5093",
+      "migrations_dir": "migrations_refunds"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "STICKY_BOT",
+        "class_name": "StickyBotDO"
+      },
+      {
+        "name": "STAFF_LOA",
+        "class_name": "StaffLoaDO"
+      },
+      {
+        "name": "PUNISHMENT_SEQUENCE",
+        "class_name": "PunishmentSequenceDO"
+      },
+      {
+        "name": "SUGGESTIONS",
+        "class_name": "SuggestionsDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "StickyBotDO"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "StaffLoaDO"
+      ]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "PunishmentSequenceDO"
+      ]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "SuggestionsDO"
+      ]
+    }
+  ]
+}
