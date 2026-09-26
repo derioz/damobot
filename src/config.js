@@ -5,7 +5,7 @@
 
 // Canonical application version (single source of truth for all Components V2 interfaces)
 // Note: Kept here directly for scripts/bump-version.js compatibility.
-export const DAMO_BOT_VERSION = "v0.9.83-beta";
+export const DAMO_BOT_VERSION = "v0.9.85-beta";
 
 // Re-export modular configuration domains
 export {

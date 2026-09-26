@@ -273,6 +273,46 @@ export function getTodayInChicago(date = null) {
 }
 
 /**
+ * Convert an ISO date string (YYYY-MM-DD) to a Unix timestamp in seconds for Discord formatting.
+ * Defaults to America/Chicago noon (17:00 UTC).
+ *
+ * @param {string} isoDate - YYYY-MM-DD
+ * @param {Object} [options]
+ * @param {"start"|"noon"|"end"} [options.timeOfDay="noon"]
+ * @returns {number} Unix timestamp in seconds
+ */
+export function isoToDiscordTimestamp(isoDate, { timeOfDay = "noon" } = {}) {
+  if (!isoDate || typeof isoDate !== "string") {
+    return Math.floor(Date.now() / 1000);
+  }
+  const parts = isoDate.split("-");
+  if (parts.length !== 3) {
+    return Math.floor(Date.now() / 1000);
+  }
+  const [yyyy, mm, dd] = parts.map((p) => parseInt(p, 10));
+  let hours = 12;
+  if (timeOfDay === "start") hours = 0;
+  if (timeOfDay === "end") hours = 23;
+  // America/Chicago CDT is UTC-5, CST is UTC-6. Using 17:00 UTC corresponds to noon/daytime.
+  const utcHours = hours + 5;
+  const d = new Date(Date.UTC(yyyy, mm - 1, dd, utcHours, 0, 0));
+  return Math.floor(d.getTime() / 1000);
+}
+
+/**
+ * Format a Discord timestamp string (e.g. <t:1700000000:D> or <t:1700000000:R>).
+ *
+ * @param {string} isoDate - YYYY-MM-DD
+ * @param {string} [style="D"] - "D" (date), "R" (relative), "F" (full)
+ * @param {Object} [options]
+ * @returns {string} Discord timestamp tag
+ */
+export function formatDiscordTimestamp(isoDate, style = "D", options = {}) {
+  const ts = isoToDiscordTimestamp(isoDate, options);
+  return `<t:${ts}:${style}>`;
+}
+
+/**
  * Determine LOA status dynamically based on current Chicago date and record fields.
  *
  * @param {Object} loa
@@ -288,8 +328,11 @@ export function getLoaStatus(loa, todayIso = getTodayInChicago()) {
   if (loa.cancelled) {
     return { code: "CANCELLED", label: "⚪ Cancelled" };
   }
-  if (loa.ended_early || loa.ended_at) {
-    return { code: "ENDED_EARLY", label: "⚪ Ended Early" };
+  if (loa.ended_early || loa.return_type === "EARLY_RETURN") {
+    return { code: "ENDED_EARLY", label: "⚪ Returned Early" };
+  }
+  if (loa.ended_at || loa.role_restore_status === "completed") {
+    return { code: "COMPLETED", label: "🔵 Completed" };
   }
   if (todayIso < loa.start_date) {
     return { code: "UPCOMING", label: "🟡 Upcoming" };
@@ -297,5 +340,18 @@ export function getLoaStatus(loa, todayIso = getTodayInChicago()) {
   if (todayIso >= loa.start_date && todayIso <= loa.end_date) {
     return { code: "ACTIVE", label: "🟢 Active" };
   }
+  // If todayIso > loa.end_date and the LOA was active/swapped and not completed, it is OVERDUE
+  if (
+    (loa.status === "active" ||
+      loa.is_active === 1 ||
+      loa.role_swap_status === "completed" ||
+      loa.overdue) &&
+    !loa.ended_at &&
+    !loa.cancelled &&
+    !loa.ended_early
+  ) {
+    return { code: "OVERDUE", label: "🔴 OVERDUE" };
+  }
   return { code: "COMPLETED", label: "🔵 Completed" };
 }
+

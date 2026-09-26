@@ -643,8 +643,11 @@ export async function executeLoaRoleSwap({
     };
   }
 
-  // Step 1: Fetch guild roles & bot member
-  const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+  // Step 1: Fetch guild roles & bot member in parallel
+  const [rolesRes, botMemberRes] = await Promise.all([
+    getGuildRoles({ env, guildId, customFetch }),
+    getBotGuildMember({ env, guildId, customFetch }),
+  ]);
   if (!rolesRes.success || !rolesRes.roleMap) {
     return {
       success: false,
@@ -652,8 +655,6 @@ export async function executeLoaRoleSwap({
     };
   }
   const roleMap = rolesRes.roleMap;
-
-  const botMemberRes = await getBotGuildMember({ env, guildId, customFetch });
   const botHighestPosition = botMemberRes.success
     ? getBotHighestRolePosition(botMemberRes.member, roleMap)
     : Infinity;
@@ -964,12 +965,13 @@ export async function executeLoaRoleRestore({
     };
   }
 
-  // Fetch guild roles to check which roles still exist and are manageable
-  const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+  // Fetch guild roles & bot member in parallel to check which roles still exist and are manageable
+  const [rolesRes, botMemberRes] = await Promise.all([
+    getGuildRoles({ env, guildId, customFetch }),
+    getBotGuildMember({ env, guildId, customFetch }),
+  ]);
   const roleMap = rolesRes.success && rolesRes.roleMap ? rolesRes.roleMap : new Map();
   const guildRolesAvailable = rolesRes.success && roleMap && roleMap.size > 0;
-
-  const botMemberRes = await getBotGuildMember({ env, guildId, customFetch });
   const botHighestPosition = botMemberRes.success
     ? getBotHighestRolePosition(botMemberRes.member, roleMap)
     : Infinity;

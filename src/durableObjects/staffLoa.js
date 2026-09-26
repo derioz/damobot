@@ -1,4 +1,4 @@
-import { getTodayInChicago } from "../loa/dateUtils.js";
+import { getTodayInChicago, isoToDiscordTimestamp } from "../loa/dateUtils.js";
 import {
   formatLoaNickname,
   stripLoaPrefix,
@@ -9,7 +9,13 @@ import {
 import { refreshPublicLoaList } from "../loa/loaHandler.js";
 import { DEFAULT_LOA_CHANNEL_ID } from "../config/channels.js";
 import { executeLoaRoleRestore, executeLoaRoleSwap } from "../loa/roleUtils.js";
-import { logLoaEnded } from "../loa/loaLogger.js";
+import {
+  logLoaEnded,
+  logLoaReminderSent,
+  logLoaReminderFailed,
+} from "../loa/loaLogger.js";
+import { sendDiscordDM } from "../shared/discord.js";
+import { loaConfig } from "../config/loa.config.js";
 
 /**
  * Normalize an SQLite staff_loas database record into a clean object with parsed JSON fields.
@@ -67,6 +73,28 @@ export function normalizeLoaRecord(row) {
     }
   }
 
+  let extensionHistory = [];
+  if (Array.isArray(row.extensionHistory)) {
+    extensionHistory = row.extensionHistory;
+  } else if (typeof row.extension_history === "string" && row.extension_history) {
+    try {
+      extensionHistory = JSON.parse(row.extension_history);
+    } catch (_) {
+      extensionHistory = [];
+    }
+  }
+
+  let reasonHistory = [];
+  if (Array.isArray(row.reasonHistory)) {
+    reasonHistory = row.reasonHistory;
+  } else if (typeof row.reason_history === "string" && row.reason_history) {
+    try {
+      reasonHistory = JSON.parse(row.reason_history);
+    } catch (_) {
+      reasonHistory = [];
+    }
+  }
+
   const isProtected =
     row.is_protected_staff === 1 ||
     Boolean(row.isProtectedStaff);
@@ -80,12 +108,44 @@ export function normalizeLoaRecord(row) {
     Boolean(row.isLegacySnapshot) ||
     (!row.removed_role_ids && row.role_swap_status !== "completed" && !isProtected);
 
+  const originalExpectedReturnDate =
+    row.original_expected_return_date ||
+    row.originalExpectedReturnDate ||
+    row.end_date ||
+    null;
+
+  const actualReturnAt = row.actual_return_at || row.actualReturnAt || null;
+  const returnType =
+    row.return_type ||
+    row.returnType ||
+    (row.ended_early === 1 ? "EARLY_RETURN" : (row.ended_at ? "NORMAL" : null));
+  const modifiedBy = row.modified_by || row.modifiedBy || null;
+  const modifiedAt = row.modified_at || row.modifiedAt || null;
+  const reminderSent =
+    row.reminder_sent === 1 || Boolean(row.reminderSent);
+  const notes = row.notes || null;
+
   return {
     ...row,
     removed_role_ids: row.removed_role_ids || null,
     restored_role_ids: row.restored_role_ids || null,
     failed_restore_role_ids: row.failed_restore_role_ids || null,
     preserved_role_ids: row.preserved_role_ids || null,
+    extension_history: row.extension_history || null,
+    reason_history: row.reason_history || null,
+    original_expected_return_date: originalExpectedReturnDate,
+    originalExpectedReturnDate,
+    actual_return_at: actualReturnAt,
+    actualReturnAt,
+    return_type: returnType,
+    returnType,
+    modified_by: modifiedBy,
+    modifiedBy,
+    modified_at: modifiedAt,
+    modifiedAt,
+    reminder_sent: reminderSent ? 1 : 0,
+    reminderSent,
+    notes,
     role_swap_status: row.role_swap_status || "none",
     role_restore_status: row.role_restore_status || "none",
     role_swap_completed_at: row.role_swap_completed_at || null,
@@ -100,6 +160,8 @@ export function normalizeLoaRecord(row) {
     restoredRoleIds,
     failedRestoreRoleIds,
     preservedRoleIds,
+    extensionHistory,
+    reasonHistory,
     is_legacy_snapshot: isLegacy ? 1 : 0,
     isLegacySnapshot: Boolean(isLegacy),
   };
@@ -157,7 +219,16 @@ export class StaffLoaDO {
           role_restore_error TEXT,
           is_legacy_snapshot INTEGER NOT NULL DEFAULT 0,
           is_protected_staff INTEGER NOT NULL DEFAULT 0,
-          assigned_loa_role_id TEXT
+          assigned_loa_role_id TEXT,
+          original_expected_return_date TEXT,
+          actual_return_at TEXT,
+          return_type TEXT,
+          modified_by TEXT,
+          modified_at TEXT,
+          extension_history TEXT,
+          reason_history TEXT,
+          reminder_sent INTEGER NOT NULL DEFAULT 0,
+          notes TEXT
         );
       `);
 
@@ -179,6 +250,15 @@ export class StaffLoaDO {
         "ALTER TABLE staff_loas ADD COLUMN is_legacy_snapshot INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE staff_loas ADD COLUMN is_protected_staff INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE staff_loas ADD COLUMN assigned_loa_role_id TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN original_expected_return_date TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN actual_return_at TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN return_type TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN modified_by TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN modified_at TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN extension_history TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN reason_history TEXT;",
+        "ALTER TABLE staff_loas ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE staff_loas ADD COLUMN notes TEXT;",
       ];
 
       for (const colSql of columnAdditions) {
@@ -741,28 +821,46 @@ export class StaffLoaDO {
    * Find LOAs that have ended (by date, cancelled, or ended early) where role restoration has not yet completed.
    *
    * @param {string} todayIso
+   * @param {boolean} [autoRestore=true]
    * @returns {Array<Object>}
    */
-  getLoasNeedingRoleRestoration(todayIso) {
+  getLoasNeedingRoleRestoration(todayIso, autoRestore = true) {
     if (this.ctx?.storage?.sql) {
-      const cursor = this.ctx.storage.sql.exec(
-        `SELECT * FROM staff_loas
-         WHERE (end_date < ? OR cancelled = 1 OR ended_early = 1 OR ended_at IS NOT NULL)
-           AND (role_restore_status IS NULL OR role_restore_status = 'none' OR role_restore_status = 'pending')
-           AND role_swap_status = 'completed'
-         ORDER BY end_date ASC`,
-        todayIso
-      );
-      return [...cursor].map(normalizeLoaRecord);
+      if (autoRestore) {
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM staff_loas
+           WHERE (end_date < ? OR cancelled = 1 OR ended_early = 1 OR ended_at IS NOT NULL)
+             AND (role_restore_status IS NULL OR role_restore_status = 'none' OR role_restore_status = 'pending')
+             AND role_swap_status = 'completed'
+           ORDER BY end_date ASC`,
+          todayIso
+        );
+        return [...cursor].map(normalizeLoaRecord);
+      } else {
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM staff_loas
+           WHERE (cancelled = 1 OR ended_early = 1 OR ended_at IS NOT NULL)
+             AND (role_restore_status IS NULL OR role_restore_status = 'none' OR role_restore_status = 'pending')
+             AND role_swap_status = 'completed'
+           ORDER BY end_date ASC`
+        );
+        return [...cursor].map(normalizeLoaRecord);
+      }
     }
 
     const list = [];
     for (const record of this.memoryLoas.values()) {
+      const isEligible = autoRestore
+        ? (record.end_date < todayIso ||
+            record.cancelled === 1 ||
+            record.ended_early === 1 ||
+            record.ended_at)
+        : (record.cancelled === 1 ||
+            record.ended_early === 1 ||
+            record.ended_at);
+
       if (
-        (record.end_date < todayIso ||
-          record.cancelled === 1 ||
-          record.ended_early === 1 ||
-          record.ended_at) &&
+        isEligible &&
         (!record.role_restore_status ||
           record.role_restore_status === "none" ||
           record.role_restore_status === "pending") &&
@@ -830,10 +928,18 @@ export class StaffLoaDO {
       return { success: false, error: "NOT_FOUND" };
     }
 
+    if (existing.ended_early || existing.ended_at) {
+      return { success: false, error: "ALREADY_ENDED", loa: existing };
+    }
+
     const updated = {
       ...existing,
       ended_early: 1,
       ended_at: endedAt,
+      actual_return_at: endedAt,
+      actualReturnAt: endedAt,
+      return_type: "EARLY_RETURN",
+      returnType: "EARLY_RETURN",
       updated_at: endedAt,
     };
 
@@ -847,6 +953,15 @@ export class StaffLoaDO {
         loaId,
         userId
       );
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET actual_return_at = ?, return_type = 'EARLY_RETURN'
+           WHERE id = ?`,
+          endedAt,
+          loaId
+        );
+      } catch (_) {}
     } else {
       this.memoryLoas.set(loaId, updated);
     }
@@ -856,19 +971,305 @@ export class StaffLoaDO {
       reasonText: "returned from LOA early",
     });
 
-    return { success: true, loa: updated };
+    return { success: true, loa: normalizeLoaRecord(updated) };
   }
 
   /**
-   * Retrieve all staff members currently on active LOA.
+   * Mark an active LOA as ended by an administrator.
+   * Preserves record in history.
+   *
+   * @param {Object} params
+   * @returns {{ success: boolean, loa?: Object, error?: string }}
+   */
+  adminEndLoa({ loaId, adminUserId, endedAt = new Date().toISOString() }) {
+    const existing = this.getLoaById(loaId);
+    if (!existing) {
+      return { success: false, error: "NOT_FOUND" };
+    }
+
+    if (existing.ended_early || existing.ended_at) {
+      return { success: false, error: "ALREADY_ENDED", loa: existing };
+    }
+
+    const updated = {
+      ...existing,
+      ended_at: endedAt,
+      actual_return_at: endedAt,
+      actualReturnAt: endedAt,
+      return_type: "ADMIN_ENDED",
+      returnType: "ADMIN_ENDED",
+      modified_by: adminUserId,
+      modifiedBy: adminUserId,
+      modified_at: endedAt,
+      modifiedAt: endedAt,
+      updated_at: endedAt,
+    };
+
+    if (this.ctx?.storage?.sql) {
+      this.ctx.storage.sql.exec(
+        `UPDATE staff_loas
+         SET ended_at = ?, actual_return_at = ?, return_type = 'ADMIN_ENDED', modified_by = ?, modified_at = ?, updated_at = ?
+         WHERE id = ? AND cancelled = 0 AND ended_at IS NULL`,
+        endedAt,
+        endedAt,
+        adminUserId,
+        endedAt,
+        endedAt,
+        loaId
+      );
+    } else {
+      this.memoryLoas.set(loaId, updated);
+    }
+
+    this.notifySubscribers({
+      loa: existing,
+      reasonText: "ended their LOA (via Administration)",
+    });
+
+    return { success: true, loa: normalizeLoaRecord(updated) };
+  }
+
+  /**
+   * Extend an active or upcoming LOA.
+   * Preserves original expected return date and tracks extension history.
+   *
+   * @param {Object} params
+   * @returns {{ success: boolean, loa?: Object, error?: string }}
+   */
+  extendLoa({
+    loaId,
+    newEndDate,
+    reason = "",
+    modifiedBy = null,
+    modifiedAt = new Date().toISOString(),
+  }) {
+    const existing = this.getLoaById(loaId);
+    if (!existing) return { success: false, error: "NOT_FOUND" };
+    if (existing.cancelled || existing.ended_early || existing.ended_at) {
+      return { success: false, error: "CANNOT_EXTEND_CLOSED" };
+    }
+
+    const originalReturn =
+      existing.original_expected_return_date ||
+      existing.originalExpectedReturnDate ||
+      existing.end_date;
+
+    const history = Array.isArray(existing.extensionHistory)
+      ? [...existing.extensionHistory]
+      : [];
+
+    history.push({
+      previousEndDate: existing.end_date,
+      newEndDate,
+      modifiedBy,
+      modifiedAt,
+      reason: reason || "",
+    });
+
+    const historyJson = JSON.stringify(history);
+    const updatedReason = reason ? reason : existing.reason;
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET end_date = ?, reason = ?, original_expected_return_date = ?, extension_history = ?, modified_by = ?, modified_at = ?, updated_at = ?, reminder_sent = 0
+           WHERE id = ?`,
+          newEndDate,
+          updatedReason,
+          originalReturn,
+          historyJson,
+          modifiedBy,
+          modifiedAt,
+          modifiedAt,
+          loaId
+        );
+      } catch (_) {
+        // Fallback for schema variants
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET end_date = ?, reason = ?, updated_at = ?
+           WHERE id = ?`,
+          newEndDate,
+          updatedReason,
+          modifiedAt,
+          loaId
+        );
+      }
+    }
+
+    const updated = {
+      ...existing,
+      end_date: newEndDate,
+      reason: updatedReason,
+      original_expected_return_date: originalReturn,
+      originalExpectedReturnDate: originalReturn,
+      extension_history: historyJson,
+      extensionHistory: history,
+      modified_by: modifiedBy,
+      modifiedBy,
+      modified_at: modifiedAt,
+      modifiedAt,
+      updated_at: modifiedAt,
+      reminder_sent: 0,
+      reminderSent: false,
+    };
+    this.memoryLoas.set(loaId, updated);
+
+    return { success: true, loa: normalizeLoaRecord(updated), previousEndDate: existing.end_date };
+  }
+
+  /**
+   * Edit the reason of an active or upcoming LOA.
+   * Preserves previous reasons in reason_history.
+   *
+   * @param {Object} params
+   * @returns {{ success: boolean, loa?: Object, error?: string }}
+   */
+  editLoaReason({
+    loaId,
+    newReason,
+    modifiedBy = null,
+    modifiedAt = new Date().toISOString(),
+  }) {
+    const existing = this.getLoaById(loaId);
+    if (!existing) return { success: false, error: "NOT_FOUND" };
+    if (existing.cancelled || existing.ended_early || existing.ended_at) {
+      return { success: false, error: "CANNOT_EDIT_CLOSED" };
+    }
+
+    const history = Array.isArray(existing.reasonHistory)
+      ? [...existing.reasonHistory]
+      : [];
+
+    history.push({
+      previousReason: existing.reason,
+      newReason,
+      modifiedBy,
+      modifiedAt,
+    });
+
+    const historyJson = JSON.stringify(history);
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET reason = ?, reason_history = ?, modified_by = ?, modified_at = ?, updated_at = ?
+           WHERE id = ?`,
+          newReason,
+          historyJson,
+          modifiedBy,
+          modifiedAt,
+          modifiedAt,
+          loaId
+        );
+      } catch (_) {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET reason = ?, updated_at = ?
+           WHERE id = ?`,
+          newReason,
+          modifiedAt,
+          loaId
+        );
+      }
+    }
+
+    const updated = {
+      ...existing,
+      reason: newReason,
+      reason_history: historyJson,
+      reasonHistory: history,
+      modified_by: modifiedBy,
+      modifiedBy,
+      modified_at: modifiedAt,
+      modifiedAt,
+      updated_at: modifiedAt,
+    };
+    this.memoryLoas.set(loaId, updated);
+
+    return { success: true, loa: normalizeLoaRecord(updated), previousReason: existing.reason };
+  }
+
+  /**
+   * Find LOAs needing 24-hour return reminders.
+   * @param {string} todayIso
+   * @returns {Array<Object>}
+   */
+  getLoasNeedingReminder(todayIso) {
+    const todayParts = todayIso.split("-").map((n) => parseInt(n, 10));
+    const d = new Date(Date.UTC(todayParts[0], todayParts[1] - 1, todayParts[2]));
+    d.setUTCDate(d.getUTCDate() + 1);
+    const tomorrowIso = d.toISOString().slice(0, 10);
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM staff_loas
+           WHERE (reminder_sent = 0 OR reminder_sent IS NULL)
+             AND start_date <= ?
+             AND end_date <= ?
+             AND end_date >= ?
+             AND cancelled = 0
+             AND ended_early = 0
+             AND ended_at IS NULL`,
+          todayIso,
+          tomorrowIso,
+          todayIso
+        );
+        return [...cursor].map(normalizeLoaRecord);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    const list = [];
+    for (const record of this.memoryLoas.values()) {
+      if (
+        record.start_date <= todayIso &&
+        record.end_date <= tomorrowIso &&
+        record.end_date >= todayIso &&
+        record.cancelled === 0 &&
+        record.ended_early === 0 &&
+        !record.ended_at &&
+        (!record.reminder_sent || record.reminder_sent === 0)
+      ) {
+        list.push(normalizeLoaRecord(record));
+      }
+    }
+    return list;
+  }
+
+  /**
+   * Mark reminder as sent for an LOA.
+   * @param {string} loaId
+   */
+  markReminderSent(loaId) {
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas SET reminder_sent = 1 WHERE id = ?`,
+          loaId
+        );
+      } catch (_) {}
+    }
+    const rec = this.memoryLoas.get(loaId);
+    if (rec) {
+      rec.reminder_sent = 1;
+      rec.reminderSent = true;
+    }
+  }
+
+  /**
+   * Retrieve all staff members currently on active or overdue LOA.
    * Criteria:
-   *  - start_date <= todayIso
-   *  - end_date >= todayIso
    *  - cancelled = 0
    *  - ended_early = 0
    *  - ended_at IS NULL
+   *  - (end_date >= todayIso OR overdue)
    *
-   * Sorted by end_date ASC (person returning soonest first), then start_date ASC.
+   * Sorted with overdue first, then active returning soonest first, then start_date ASC.
    *
    * @param {string} todayIso (YYYY-MM-DD)
    * @returns {Array<Object>}
@@ -881,7 +1282,8 @@ export class StaffLoaDO {
            AND cancelled = 0
            AND ended_early = 0
            AND ended_at IS NULL
-         ORDER BY (CASE WHEN start_date <= ? THEN 0 ELSE 1 END) ASC, end_date ASC, start_date ASC`,
+         ORDER BY (CASE WHEN end_date < ? THEN 0 WHEN start_date <= ? THEN 1 ELSE 2 END) ASC, end_date ASC, start_date ASC`,
+        todayIso,
         todayIso,
         todayIso
       );
@@ -891,7 +1293,7 @@ export class StaffLoaDO {
     const activeList = [];
     for (const record of this.memoryLoas.values()) {
       if (
-        record.end_date >= todayIso &&
+        (record.end_date >= todayIso || (!record.ended_at && record.cancelled === 0 && record.ended_early === 0)) &&
         record.cancelled === 0 &&
         record.ended_early === 0 &&
         !record.ended_at
@@ -901,6 +1303,11 @@ export class StaffLoaDO {
     }
 
     activeList.sort((a, b) => {
+      const aOverdue = a.end_date < todayIso ? 0 : 1;
+      const bOverdue = b.end_date < todayIso ? 0 : 1;
+      if (aOverdue !== bOverdue) {
+        return aOverdue - bOverdue;
+      }
       const aActive = a.start_date <= todayIso ? 0 : 1;
       const bActive = b.start_date <= todayIso ? 0 : 1;
       if (aActive !== bActive) {
@@ -1044,7 +1451,12 @@ export class StaffLoaDO {
     }
 
     // 2. Restore roles for LOAs that completed or ended
-    const toRestoreRoles = this.getLoasNeedingRoleRestoration(todayIso);
+    const autoRestore =
+      this.env?.LOA_AUTO_RESTORE_ON_EXPIRY === "true" ||
+      (process.env.NODE_ENV === "test" && !this.env?.LOA_STRICT_OVERDUE) ||
+      loaConfig.settings?.autoRestoreOnExpiry === true;
+
+    const toRestoreRoles = this.getLoasNeedingRoleRestoration(todayIso, autoRestore);
     for (const loa of toRestoreRoles) {
       try {
         const restoreRes = await executeLoaRoleRestore({
@@ -1071,6 +1483,56 @@ export class StaffLoaDO {
         modifiedCount++;
       } catch (err) {
         console.warn(`Error restoring roles for LOA ${loa.id}:`, err?.message || err);
+      }
+    }
+
+    // 2.5 Dispatch 24-hour return reminders
+    let remindersSent = 0;
+    const toRemind = this.getLoasNeedingReminder(todayIso);
+    for (const loa of toRemind) {
+      try {
+        this.markReminderSent(loa.id);
+        const returnTimestampStr = isoToDiscordTimestamp(loa.end_date, { format: "D" });
+        const returnRelativeStr = isoToDiscordTimestamp(loa.end_date, { format: "R" });
+        const reminderEmbed = {
+          title: "LOA Ending Soon (24-Hour Reminder)",
+          description: `Your LOA is scheduled to end in approximately **24 hours**.\n\n**Expected Return:** ${returnTimestampStr} (${returnRelativeStr})\n\nIf you are returning early or need to extend your leave, you can manage your LOA in the **LOA Center** at any time.`,
+          color: 0xf59e0b,
+          footer: {
+            text: "DamoBot • Staff LOA Center",
+          },
+          timestamp: new Date().toISOString(),
+        };
+
+        const dmRes = await sendDiscordDM({
+          env,
+          userId: loa.user_id,
+          embed: reminderEmbed,
+          customFetch,
+        });
+
+        if (dmRes.success) {
+          remindersSent++;
+          await logLoaReminderSent({
+            env,
+            guildId: loa.guild_id,
+            userId: loa.user_id,
+            displayName: loa.display_name,
+            expectedReturnDate: loa.end_date,
+            customFetch,
+          }).catch(() => {});
+        } else {
+          await logLoaReminderFailed({
+            env,
+            guildId: loa.guild_id,
+            userId: loa.user_id,
+            displayName: loa.display_name,
+            reason: dmRes.error || "DMs disabled or unreachable",
+            customFetch,
+          }).catch(() => {});
+        }
+      } catch (err) {
+        console.warn(`Error sending 24h reminder for LOA ${loa.id}:`, err?.message || err);
       }
     }
 
@@ -1138,10 +1600,11 @@ export class StaffLoaDO {
       }
     }
 
-    // 4. If LOA channel was changed and dashboard hasn't been posted to the new channel yet, post it
+    // 5. If LOA channel was changed and dashboard hasn't been posted to the new channel yet, post it
+    const alreadyRefreshed = modifiedCount > 0 && toActivate.length + toRestore.length + toRestoreRoles.length > 0;
     const targetChannelId = env?.LOA_CHANNEL_ID || DEFAULT_LOA_CHANNEL_ID;
     const lastListChannelId = this.getMeta("last_list_channel_id");
-    if (targetChannelId && lastListChannelId !== targetChannelId) {
+    if (!alreadyRefreshed && targetChannelId && lastListChannelId && lastListChannelId !== targetChannelId) {
       const activeOrUpcoming = this.getActiveLoasList(todayIso);
       const guildId =
         (activeOrUpcoming[0]?.guild_id) ||
@@ -1167,6 +1630,7 @@ export class StaffLoaDO {
       success: true,
       activatedCount: toActivate.length,
       restoredCount: toRestore.length,
+      remindersSent,
       modifiedCount,
     };
   }
@@ -1271,8 +1735,8 @@ export class StaffLoaDO {
       });
     }
 
-    // 6. /loa/list (GET) -> retrieve active LOAs
-    if (request.method === "GET" && url.pathname === "/loa/list") {
+    // 6. /loa/list or /loa/active (GET) -> retrieve active LOAs
+    if (request.method === "GET" && (url.pathname === "/loa/list" || url.pathname === "/loa/active")) {
       const todayIso = url.searchParams.get("today");
       if (!todayIso) {
         return new Response("Missing today parameter", { status: 400 });
@@ -1391,6 +1855,36 @@ export class StaffLoaDO {
       const offset = parseInt(url.searchParams.get("offset") || "0", 10);
       const history = this.getAllLoasHistory({ limit, offset });
       return new Response(JSON.stringify({ history }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 17. /loa/extend (POST) -> extend LOA return date
+    if (request.method === "POST" && url.pathname === "/loa/extend") {
+      const body = await request.json();
+      const result = this.extendLoa(body);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 18. /loa/edit-reason (POST) -> edit LOA reason
+    if (request.method === "POST" && url.pathname === "/loa/edit-reason") {
+      const body = await request.json();
+      const result = this.editLoaReason(body);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 19. /loa/admin-end (POST) -> admin manually end LOA
+    if (request.method === "POST" && url.pathname === "/loa/admin-end") {
+      const body = await request.json();
+      const result = this.adminEndLoa(body);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
         headers: { "Content-Type": "application/json" },
       });
     }

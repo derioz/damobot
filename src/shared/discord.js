@@ -488,3 +488,76 @@ export function getUserAvatarUrl(user = {}) {
 
   return "https://cdn.discordapp.com/embed/avatars/0.png";
 }
+
+/**
+ * Safely send a Direct Message (DM) to a Discord user.
+ * Opens or retrieves the DM channel via POST /users/@me/channels, then posts the message.
+ * Safely handles and catches HTTP 403 / Discord error 50007 (Cannot send messages to this user)
+ * if the user has DMs disabled or blocked the bot.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.userId
+ * @param {string} [options.content]
+ * @param {Object} [options.embed]
+ * @param {Function} [options.customFetch=fetch]
+ * @returns {Promise<{ success: boolean, channelId?: string, error?: string, status?: number }>}
+ */
+export async function sendDiscordDM({
+  env,
+  userId,
+  content,
+  embed,
+  customFetch = fetch,
+}) {
+  const token = env?.DISCORD_BOT_TOKEN;
+  if (!token || !userId) {
+    return { success: false, error: "Missing bot token or userId" };
+  }
+
+  try {
+    // 1. Create or get DM channel
+    const channelRes = await customFetch("https://discord.com/api/v10/users/@me/channels", {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ recipient_id: userId }),
+    });
+
+    if (!channelRes.ok) {
+      const errText = await channelRes.text();
+      return { success: false, error: errText, status: channelRes.status };
+    }
+
+    const dmChannel = await channelRes.json();
+    const channelId = dmChannel?.id;
+    if (!channelId) {
+      return { success: false, error: "No channel ID returned from DM channel creation" };
+    }
+
+    // 2. Send DM message
+    const msgRes = await customFetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        content: content || undefined,
+        embeds: embed ? [embed] : undefined,
+      }),
+    });
+
+    if (!msgRes.ok) {
+      const errText = await msgRes.text();
+      return { success: false, error: errText, status: msgRes.status };
+    }
+
+    return { success: true, channelId };
+  } catch (err) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+

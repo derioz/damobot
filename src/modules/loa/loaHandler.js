@@ -10,6 +10,8 @@ import {
   formatCompactDateRange,
   getTodayInChicago,
   getLoaStatus,
+  isoToDiscordTimestamp,
+  formatDiscordTimestamp,
 } from "./dateUtils.js";
 import {
   formatLoaNickname,
@@ -43,7 +45,10 @@ import {
   logLoaStarted,
   logLoaEnded,
   logLoaWarning,
+  logLoaExtended,
+  logLoaReasonEdited,
 } from "./loaLogger.js";
+import { sendDiscordDM } from "../../shared/discord.js";
 
 export const IS_COMPONENTS_V2_FLAG = 32768; // 1 << 15
 export const EPHEMERAL_FLAG = InteractionResponseFlags.EPHEMERAL; // 64
@@ -78,17 +83,30 @@ export const ButtonStyle = {
 
 export const LoaCustomId = {
   BTN_START: "loa_btn_start",
-  BTN_EDIT: "loa_btn_edit",
-  BTN_CANCEL: "loa_btn_cancel",
+  BTN_ACTIVE: "loa_btn_active",
   BTN_STATUS: "loa_btn_status",
+  BTN_HISTORY: "loa_btn_history",
   BTN_REFRESH: "loa_btn_refresh",
   BTN_ALERTS: "loa_btn_alerts",
+  BTN_EDIT: "loa_btn_edit",
+  BTN_EXTEND: "loa_btn_extend",
+  BTN_EDIT_REASON: "loa_btn_edit_reason",
+  BTN_CANCEL: "loa_btn_cancel",
   CANCEL_DISMISS: "loa_cancel_dismiss",
   CONFIRM_CANCEL_PREFIX: "loa_confirm_cancel:",
   CONFIRM_RETURN_PREFIX: "loa_confirm_return:",
   ALERT_TOGGLE_PREFIX: "loa_alert_toggle:",
+  SELECT_ADMIN_TARGET: "loa_select_admin_target",
+  BTN_ADMIN_EXTEND_PREFIX: "loa_admin_extend:",
+  BTN_ADMIN_END_PREFIX: "loa_admin_end:",
+  BTN_ADMIN_HISTORY_PREFIX: "loa_admin_history:",
+  BTN_PAGE_ACTIVE_PREFIX: "loa_page_active:",
+  BTN_PAGE_HISTORY_PREFIX: "loa_page_history:",
+  CONFIRM_ADMIN_END_PREFIX: "loa_confirm_admin_end:",
   MODAL_START: "loa_modal_start",
   MODAL_EDIT_PREFIX: "loa_modal_edit",
+  MODAL_EXTEND_PREFIX: "loa_modal_extend:",
+  MODAL_EDIT_REASON_PREFIX: "loa_modal_edit_reason:",
 };
 
 /**
@@ -239,8 +257,32 @@ export function createButton({
 }
 
 /**
- * Build the standard LOA control panel Action Row (4 controls).
- * [ 🏖️ Start LOA ] [ 👤 My LOA ] [ 🔄 Refresh ] [ 🔔 Return Alerts ]
+ * Build a String Select component (Type 3).
+ * @param {Object} options
+ * @returns {Object}
+ */
+export function createStringSelect({
+  customId,
+  placeholder = "Select an option...",
+  options = [],
+  minValues = 1,
+  maxValues = 1,
+  disabled = false,
+}) {
+  return {
+    type: ComponentType.STRING_SELECT,
+    custom_id: customId,
+    placeholder,
+    options,
+    min_values: minValues,
+    max_values: maxValues,
+    disabled,
+  };
+}
+
+/**
+ * Build the standard LOA control panel Action Rows.
+ * Buttons: [ 🏖️ Start LOA ] [ 📋 View Active LOAs ] [ 👤 My LOA ] [ 📜 LOA History ] [ 🔄 Refresh ]
  *
  * @returns {Array<Object>}
  */
@@ -254,22 +296,28 @@ export function createLoaControlActionRows() {
         emoji: "🏖️",
       }),
       createButton({
+        customId: LoaCustomId.BTN_ACTIVE,
+        label: "View Active LOAs",
+        style: ButtonStyle.SECONDARY,
+        emoji: "📋",
+      }),
+      createButton({
         customId: LoaCustomId.BTN_STATUS,
         label: "My LOA",
         style: ButtonStyle.SECONDARY,
         emoji: "👤",
       }),
       createButton({
+        customId: LoaCustomId.BTN_HISTORY,
+        label: "LOA History",
+        style: ButtonStyle.SECONDARY,
+        emoji: "📜",
+      }),
+      createButton({
         customId: LoaCustomId.BTN_REFRESH,
         label: "Refresh",
         style: ButtonStyle.SECONDARY,
         emoji: "🔄",
-      }),
-      createButton({
-        customId: LoaCustomId.BTN_ALERTS,
-        label: "Return Alerts",
-        style: ButtonStyle.SECONDARY,
-        emoji: "🔔",
       }),
     ]),
   ];
@@ -564,11 +612,15 @@ export function buildLoaListContainers(
       innerComponents.push(createSeparator(true, 1));
       const cleanDisplayName = stripLoaPrefix(staff.display_name);
       const isUpcoming = staff.start_date > todayIso;
-      const isReturningToday = !isUpcoming && staff.end_date === todayIso;
+      const isOverdue = !isUpcoming && staff.end_date < todayIso;
+      const isReturningToday = !isUpcoming && !isOverdue && staff.end_date === todayIso;
 
       let subText;
       let statusIcon;
-      if (isUpcoming) {
+      if (isOverdue) {
+        statusIcon = "🔴";
+        subText = `⚠️ OVERDUE (Was due ${formatPrettyDate(staff.end_date)})`;
+      } else if (isUpcoming) {
         statusIcon = "🟡";
         subText = `🗓️ Starts ${formatPrettyDate(staff.start_date)}`;
       } else {
@@ -981,6 +1033,7 @@ export async function executeLoaStart({
   startDateVal,
   endDateVal,
   reasonVal,
+  notesVal = null,
   todayIso,
   stub,
   customFetch = fetch,
@@ -1081,6 +1134,7 @@ export async function executeLoaStart({
         startDate: parsedStart.isoDate,
         endDate: parsedEnd.isoDate,
         reason: trimmedReason,
+        notes: notesVal?.trim() || null,
         todayIso,
         originalNickname: memberNick,
         loaNickname,
@@ -1157,46 +1211,90 @@ export async function executeLoaStart({
         );
       }
 
-      // Role swap succeeded! Send audit log to #loa-logs
-      await logLoaStarted({
-        env,
-        guildId,
-        userId,
-        loa: data.loa || {
-          id: newLoaId,
-          guild_id: guildId,
-          user_id: userId,
-          display_name: displayName,
-          start_date: parsedStart.isoDate,
-          end_date: parsedEnd.isoDate,
-          reason: trimmedReason,
-        },
-        removedRoleIds: roleSwapResult.removedRoleIds || [],
-        preservedRoleIds: roleSwapResult.preservedRoleIds || [],
-        staffLoaRoleId: roleSwapResult.staffLoaRoleId || roleSwapResult.assignedLoaRoleId,
-        isProtectedStaff: Boolean(roleSwapResult.isProtectedStaff || roleSwapResult.isProtected),
-        customFetch,
-      }).catch((err) => {
-        console.warn("Failed to dispatch logLoaStarted embed:", err);
-      });
     }
 
-    const activityText = `🏖️ ${displayName} started an LOA • just now`;
-    await refreshPublicLoaList({
-      env,
-      guildId,
-      todayIso,
-      recentActivity: activityText,
-      customFetch,
-      repost: true,
-      ctx,
-    });
+    const startUnix = isoToDiscordTimestamp(parsedStart.isoDate, { timeOfDay: "start" });
+    const endUnix = isoToDiscordTimestamp(parsedEnd.isoDate, { timeOfDay: "noon" });
+
+    // Background non-blocking tasks: Discord audit log, public dashboard repost, and staff member DM
+    const backgroundTasks = async () => {
+      // 1. Send audit log to #loa-logs if role swap was executed
+      if (roleSwapResult && roleSwapResult.success) {
+        await logLoaStarted({
+          env,
+          guildId,
+          userId,
+          loa: data.loa || {
+            id: newLoaId,
+            guild_id: guildId,
+            user_id: userId,
+            display_name: displayName,
+            start_date: parsedStart.isoDate,
+            end_date: parsedEnd.isoDate,
+            reason: trimmedReason,
+          },
+          removedRoleIds: roleSwapResult.removedRoleIds || [],
+          preservedRoleIds: roleSwapResult.preservedRoleIds || [],
+          staffLoaRoleId: roleSwapResult.staffLoaRoleId || roleSwapResult.assignedLoaRoleId,
+          isProtectedStaff: Boolean(roleSwapResult.isProtectedStaff || roleSwapResult.isProtected),
+          customFetch,
+        }).catch((err) => {
+          console.warn("Failed to dispatch logLoaStarted embed:", err);
+        });
+      }
+
+      // 2. Repost public LOA dashboard
+      const activityText = `🏖️ ${displayName} started an LOA • just now`;
+      await refreshPublicLoaList({
+        env,
+        guildId,
+        todayIso,
+        recentActivity: activityText,
+        customFetch,
+        repost: true,
+        ctx,
+      }).catch((err) => {
+        console.warn("Failed to refresh public LOA list:", err);
+      });
+
+      // 3. Send safe DM notification to staff member
+      const dmContent = isStartingToday
+        ? `**Your LOA has started.**\n\n**Expected return:** <t:${endUnix}:D> (<t:${endUnix}:R>)\n\nYour temporary staff role changes have been applied.`
+        : `**Your LOA has been scheduled.**\n\n**Starts:** <t:${startUnix}:D>\n**Expected return:** <t:${endUnix}:D> (<t:${endUnix}:R>)`;
+
+      await sendDiscordDM({
+        env,
+        userId,
+        content: dmContent,
+        customFetch,
+      }).catch((err) => {
+        console.warn("Failed to dispatch LOA start DM:", err);
+      });
+    };
+
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(backgroundTasks());
+    } else {
+      await backgroundTasks();
+    }
+
+    const statusText = isStartingToday ? "🟢 Active" : "🟡 Upcoming";
+    const lines = [
+      "# 🏖️ Leave of Absence Submitted",
+      "**LOA Started**",
+      `**Staff Member:** <@${userId}>`,
+      `**Started:** <t:${startUnix}:D> (<t:${startUnix}:R>)`,
+      `**Expected Return:** <t:${endUnix}:D> (<t:${endUnix}:R>)`,
+      `**Scheduled:** ${formatPrettyDateRange(parsedStart.isoDate, parsedEnd.isoDate)}`,
+      `**Reason:** ${trimmedReason}`,
+    ];
+    if (notesVal && notesVal.trim()) {
+      lines.push(`**Notes:** ${notesVal.trim()}`);
+    }
+    lines.push(`**Status:** ${statusText}`);
 
     const innerComponents = [
-      createTextDisplay("# 🏖️ Leave of Absence Submitted"),
-      createTextDisplay(
-        `Your LOA has been successfully recorded and the Staff LOA Center has been updated.\n\n**Dates**\n${formatPrettyDateRange(parsedStart.isoDate, parsedEnd.isoDate)}\n\n**Reason**\n> ${trimmedReason}`
-      ),
+      createTextDisplay(lines.join("\n\n")),
       createSeparator(true, 1),
     ];
 
@@ -1469,15 +1567,25 @@ export async function executeLoaCancelOrReturn({
       }
 
       const activityText = `❌ ${displayName} cancelled their upcoming LOA • just now`;
-      await refreshPublicLoaList({
-        env,
-        guildId,
-        todayIso,
-        recentActivity: activityText,
-        customFetch,
-        repost: true,
-        ctx,
-      });
+      const refreshTask = async () => {
+        await refreshPublicLoaList({
+          env,
+          guildId,
+          todayIso,
+          recentActivity: activityText,
+          customFetch,
+          repost: true,
+          ctx,
+        }).catch((err) => {
+          console.warn("Failed to refresh public LOA list:", err);
+        });
+      };
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(refreshTask());
+      } else {
+        await refreshTask();
+      }
 
       const confirmationContainer = createContainer([
         createTextDisplay("# ❌ Leave of Absence Cancelled"),
@@ -1514,31 +1622,6 @@ export async function executeLoaCancelOrReturn({
         customFetch,
       });
 
-      await logLoaEnded({
-        env,
-        guildId,
-        userId,
-        displayName,
-        reasonText: "returned early from Leave of Absence",
-        restoredRoleIds: restoreRes.restoredRoleIds || [],
-        failedRestoreRoleIds: restoreRes.failedRestoreRoleIds || [],
-        isLegacy: restoreRes.isLegacy,
-        isProtectedStaff: Boolean(restoreRes.isProtectedStaff || restoreRes.isProtected || existing.is_protected_staff || existing.isProtectedStaff),
-        customFetch,
-      }).catch((err) => {
-        console.warn("Failed to dispatch logLoaEnded embed:", err);
-      });
-
-      if (restoreRes.failedRestoreRoleIds?.length > 0) {
-        await logLoaWarning({
-          env,
-          guildId,
-          userId,
-          message: `Some roles could not be restored automatically for ${displayName} (<@${userId}>): ${restoreRes.failedRestoreRoleIds.join(", ")}`,
-          customFetch,
-        }).catch(() => {});
-      }
-
       const endRes = await stub.fetch("https://do/loa/end-early", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1552,16 +1635,51 @@ export async function executeLoaCancelOrReturn({
         return ephemeralTextResponse(`❌ Failed to end LOA early: ${endData.error || "Unknown error"}`);
       }
 
-      const activityText = `✅ ${displayName} returned from LOA early • just now`;
-      await refreshPublicLoaList({
-        env,
-        guildId,
-        todayIso,
-        recentActivity: activityText,
-        customFetch,
-        repost: true,
-        ctx,
-      });
+      const backgroundTasks = async () => {
+        await logLoaEnded({
+          env,
+          guildId,
+          userId,
+          displayName,
+          reasonText: "returned early from Leave of Absence",
+          restoredRoleIds: restoreRes.restoredRoleIds || [],
+          failedRestoreRoleIds: restoreRes.failedRestoreRoleIds || [],
+          isLegacy: restoreRes.isLegacy,
+          isProtectedStaff: Boolean(restoreRes.isProtectedStaff || restoreRes.isProtected || existing.is_protected_staff || existing.isProtectedStaff),
+          customFetch,
+        }).catch((err) => {
+          console.warn("Failed to dispatch logLoaEnded embed:", err);
+        });
+
+        if (restoreRes.failedRestoreRoleIds?.length > 0) {
+          await logLoaWarning({
+            env,
+            guildId,
+            userId,
+            message: `Some roles could not be restored automatically for ${displayName} (<@${userId}>): ${restoreRes.failedRestoreRoleIds.join(", ")}`,
+            customFetch,
+          }).catch(() => {});
+        }
+
+        const activityText = `✅ ${displayName} returned from LOA early • just now`;
+        await refreshPublicLoaList({
+          env,
+          guildId,
+          todayIso,
+          recentActivity: activityText,
+          customFetch,
+          repost: true,
+          ctx,
+        }).catch((err) => {
+          console.warn("Failed to refresh public LOA list:", err);
+        });
+      };
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(backgroundTasks());
+      } else {
+        await backgroundTasks();
+      }
 
       const returnMsg = (restoreRes.isProtectedStaff || restoreRes.isProtected || existing.is_protected_staff || existing.isProtectedStaff)
         ? "Your Leave of Absence has ended early and your nickname has been restored. Welcome back!"
@@ -1713,9 +1831,9 @@ export async function renderMyLoaPanel({ stub, userId, todayIso }) {
 
     if (!existing) {
       const container = createContainer([
-        createTextDisplay("# 🏖️ Your LOA"),
+        createTextDisplay("# 🏖️ Your LOA\n### My LOA"),
         createSeparator(true, 1),
-        createTextDisplay("You do not currently have an active or upcoming LOA."),
+        createTextDisplay("You don't currently have an active LOA."),
         createSeparator(true, 1),
         createActionRow([
           createButton({
@@ -1734,25 +1852,60 @@ export async function renderMyLoaPanel({ stub, userId, todayIso }) {
       return ephemeralComponentsResponse([container]);
     }
 
-    const status = getLoaStatus(existing, todayIso);
     const isUpcoming = todayIso < existing.start_date;
+    const isOverdue = !isUpcoming && todayIso > existing.end_date;
+    const statusLabel = isOverdue
+      ? "🔴 OVERDUE"
+      : isUpcoming
+      ? "🟡 Upcoming"
+      : "🟢 Active";
 
-    const actionButtons = [
-      createButton({
-        customId: LoaCustomId.BTN_EDIT,
-        label: "Edit LOA",
-        style: ButtonStyle.SECONDARY,
-        emoji: "✏️",
-      }),
+    const startUnix = isoToDiscordTimestamp(existing.start_date, { timeOfDay: "start" });
+    const endUnix = isoToDiscordTimestamp(existing.end_date, { timeOfDay: "noon" });
+
+    const contentLines = [
+      "# 🏖️ Your LOA",
+      `### Status: ${statusLabel}`,
+      `**Staff Member:** <@${userId}>`,
+      `**Dates:** ${formatPrettyDateRange(existing.start_date, existing.end_date)}`,
+      `**Start Date:** <t:${startUnix}:D> (<t:${startUnix}:R>)`,
+      `**Expected Return:** <t:${endUnix}:D> (<t:${endUnix}:R>)`,
+      `**Time Remaining:** <t:${endUnix}:R>`,
+      `**Reason:** ${existing.reason}`,
     ];
 
+    if (
+      existing.original_expected_return_date &&
+      existing.original_expected_return_date !== existing.end_date
+    ) {
+      contentLines.push(
+        `-# ℹ️ Extended (Originally due: ${formatPrettyDate(existing.original_expected_return_date)})`
+      );
+    }
+    if (existing.notes) {
+      contentLines.push(`**Notes:** ${existing.notes}`);
+    }
+
+    const actionButtons = [];
     if (isUpcoming) {
       actionButtons.push(
         createButton({
           customId: LoaCustomId.BTN_CANCEL,
           label: "Cancel LOA",
           style: ButtonStyle.DANGER,
-          emoji: "❌",
+          emoji: "🚫",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_EXTEND,
+          label: "Extend LOA",
+          style: ButtonStyle.SECONDARY,
+          emoji: "⏳",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_EDIT_REASON,
+          label: "Edit Reason",
+          style: ButtonStyle.SECONDARY,
+          emoji: "✏️",
         })
       );
     } else {
@@ -1761,17 +1914,27 @@ export async function renderMyLoaPanel({ stub, userId, todayIso }) {
           customId: LoaCustomId.BTN_CANCEL,
           label: "Return Early",
           style: ButtonStyle.SUCCESS,
-          emoji: "✅",
+          emoji: "↩️",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_EXTEND,
+          label: "Extend LOA",
+          style: ButtonStyle.SECONDARY,
+          emoji: "⏳",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_EDIT_REASON,
+          label: "Edit Reason",
+          style: ButtonStyle.SECONDARY,
+          emoji: "✏️",
         })
       );
     }
 
     const container = createContainer([
-      createTextDisplay("# 🏖️ Your LOA"),
+      createTextDisplay("# 🏖️ My LOA"),
       createSeparator(true, 1),
-      createTextDisplay(
-        `### ${status.label}\n\n**Dates**\n${formatPrettyDateRange(existing.start_date, existing.end_date)}\n\n**Reason**\n> ${existing.reason}\n\n**${isUpcoming ? "Starts" : "Returns"}**\n${formatPrettyDate(isUpcoming ? existing.start_date : existing.end_date)}`
-      ),
+      createTextDisplay(contentLines.join("\n\n")),
       createSeparator(true, 1),
       createActionRow(actionButtons),
       createSeparator(true, 1),
@@ -1785,6 +1948,806 @@ export async function renderMyLoaPanel({ stub, userId, todayIso }) {
     console.error("Error fetching My LOA status:", err);
     return ephemeralTextResponse(`❌ Error checking LOA status: ${err.message || "Internal error"}`);
   }
+}
+
+/**
+ * Render the staff/admin active LOA dashboard with sorting, overdue badges, and management controls.
+ *
+ * @param {Object} params
+ * @param {Object} params.stub
+ * @param {string} params.userId
+ * @param {Object} params.env
+ * @param {Object} params.interaction
+ * @param {string} params.todayIso
+ * @param {number} [params.page=1]
+ * @returns {Promise<Response>}
+ */
+export async function renderActiveLoasDashboard({
+  stub,
+  userId,
+  env,
+  interaction,
+  todayIso,
+  page = 1,
+}) {
+  try {
+    const activeRes = await stub.fetch(
+      `https://do/loa/active?today=${encodeURIComponent(todayIso)}`
+    );
+    const activeData = await activeRes.json();
+    const loas = activeData?.loas || [];
+
+    const isManager = canManageLOAs(interaction, env);
+
+    if (loas.length === 0) {
+      const container = createContainer([
+        createTextDisplay("# 📋 Active Staff LOAs"),
+        createSeparator(true, 1),
+        createTextDisplay("🟢 There are currently no active or overdue staff LOAs."),
+        createSeparator(true, 1),
+        createActionRow([
+          createButton({
+            customId: LoaCustomId.BTN_START,
+            label: "Start LOA",
+            style: ButtonStyle.PRIMARY,
+            emoji: "🏖️",
+          }),
+          createButton({
+            customId: LoaCustomId.BTN_STATUS,
+            label: "My LOA",
+            style: ButtonStyle.SECONDARY,
+            emoji: "👤",
+          }),
+        ]),
+        createSeparator(true, 1),
+        buildDamoFooter({ productName: "Staff LOA Manager" }),
+      ]);
+      return ephemeralComponentsResponse([container]);
+    }
+
+    const PAGE_SIZE = 5;
+    const totalPages = Math.max(1, Math.ceil(loas.length / PAGE_SIZE));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const chunk = loas.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+    const overdueCount = loas.filter((l) => l.end_date < todayIso).length;
+    const activeCount = loas.filter((l) => l.start_date <= todayIso && l.end_date >= todayIso).length;
+    const upcomingCount = loas.filter((l) => l.start_date > todayIso).length;
+
+    const headerLines = [
+      `# 📋 Active Staff LOAs (Page ${currentPage} of ${totalPages})`,
+      `${activeCount} active away • ${overdueCount > 0 ? `**${overdueCount} OVERDUE** • ` : ""}${upcomingCount} scheduled`,
+    ];
+
+    const innerComponents = [
+      createTextDisplay(headerLines.join("\n")),
+      createSeparator(true, 1),
+    ];
+
+    for (const staff of chunk) {
+      const cleanName = stripLoaPrefix(staff.display_name);
+      const isOverdue = staff.end_date < todayIso;
+      const isUpcoming = staff.start_date > todayIso;
+      const statusBadge = isOverdue
+        ? "🔴 OVERDUE"
+        : isUpcoming
+        ? "🟡 Upcoming"
+        : "🟢 Active";
+
+      const startUnix = isoToDiscordTimestamp(staff.start_date, { timeOfDay: "start" });
+      const endUnix = isoToDiscordTimestamp(staff.end_date, { timeOfDay: "noon" });
+
+      const itemLines = [
+        `### ${statusBadge} • **${cleanName}** (<@${staff.user_id}>)`,
+        `**Dates:** <t:${startUnix}:D> → <t:${endUnix}:D>`,
+        `**${isOverdue ? "Overdue by" : "Remaining"}:** <t:${endUnix}:R>`,
+        `**Reason:** ${staff.reason || "*No reason provided*"}`,
+      ];
+
+      if (
+        staff.original_expected_return_date &&
+        staff.original_expected_return_date !== staff.end_date
+      ) {
+        itemLines.push(
+          `-# ℹ️ Extended (Originally due: ${formatPrettyDate(staff.original_expected_return_date)})`
+        );
+      }
+
+      innerComponents.push(createTextDisplay(itemLines.join("\n")));
+      innerComponents.push(createSeparator(true, 1));
+    }
+
+    // Admin select menu to inspect or manage an active LOA
+    if (isManager && loas.length > 0) {
+      const selectOptions = loas.slice(0, 25).map((s) => {
+        const isOverdue = s.end_date < todayIso;
+        return {
+          label: stripLoaPrefix(s.display_name).slice(0, 100),
+          value: s.id,
+          description: `${isOverdue ? "OVERDUE • " : ""}Due: ${s.end_date} • ${(s.reason || "").slice(0, 50)}`.slice(0, 100),
+          emoji: isOverdue ? { name: "🔴" } : { name: "🟢" },
+        };
+      });
+
+      innerComponents.push(
+        createTextDisplay(
+          "-# 🛠️ **Staff Admin**: Select a member below to view details, extend, or end their LOA."
+        )
+      );
+      innerComponents.push(
+        createActionRow([
+          createStringSelect({
+            customId: LoaCustomId.SELECT_ADMIN_TARGET,
+            placeholder: "Select a staff member to manage...",
+            options: selectOptions,
+          }),
+        ])
+      );
+      innerComponents.push(createSeparator(true, 1));
+    }
+
+    // Pagination row
+    if (totalPages > 1) {
+      innerComponents.push(
+        createActionRow([
+          createButton({
+            customId: `${LoaCustomId.BTN_PAGE_ACTIVE_PREFIX}${currentPage - 1}`,
+            label: "Previous",
+            style: ButtonStyle.SECONDARY,
+            disabled: currentPage <= 1,
+            emoji: "◀️",
+          }),
+          createButton({
+            customId: "noop_active_page",
+            label: `Page ${currentPage} of ${totalPages}`,
+            style: ButtonStyle.SECONDARY,
+            disabled: true,
+          }),
+          createButton({
+            customId: `${LoaCustomId.BTN_PAGE_ACTIVE_PREFIX}${currentPage + 1}`,
+            label: "Next",
+            style: ButtonStyle.SECONDARY,
+            disabled: currentPage >= totalPages,
+            emoji: "▶️",
+          }),
+        ])
+      );
+      innerComponents.push(createSeparator(true, 1));
+    }
+
+    innerComponents.push(
+      buildDamoFooter({ productName: "Staff LOA Manager" })
+    );
+
+    return ephemeralComponentsResponse([createContainer(innerComponents)]);
+  } catch (err) {
+    console.error("Error rendering active LOAs dashboard:", err);
+    return ephemeralTextResponse(`❌ Error fetching active LOAs: ${err.message || "Internal error"}`);
+  }
+}
+
+/**
+ * Render detailed admin management view for a specific LOA.
+ *
+ * @param {Object} params
+ * @param {Object} params.stub
+ * @param {string} params.loaId
+ * @param {Object} params.env
+ * @param {Object} params.interaction
+ * @param {string} params.todayIso
+ * @returns {Promise<Response>}
+ */
+export async function renderAdminLoaDetailsPanel({
+  stub,
+  loaId,
+  env,
+  interaction,
+  todayIso,
+}) {
+  try {
+    const listRes = await stub.fetch(`https://do/loa/active?today=${encodeURIComponent(todayIso)}`);
+    const listData = await listRes.json();
+    let staff = (listData?.loas || []).find((l) => l.id === loaId);
+
+    if (!staff) {
+      const histRes = await stub.fetch(`https://do/loa/history-all?limit=100`);
+      const histData = await histRes.json();
+      staff = (histData?.history || []).find((l) => l.id === loaId);
+    }
+
+    if (!staff) {
+      return ephemeralTextResponse("❌ Could not locate the specified LOA record.");
+    }
+
+    const cleanName = stripLoaPrefix(staff.display_name);
+    const isOverdue =
+      staff.end_date < todayIso &&
+      !staff.ended_at &&
+      !staff.ended_early &&
+      !staff.cancelled;
+    const isUpcoming = staff.start_date > todayIso;
+    const statusLabel = isOverdue
+      ? "🔴 OVERDUE"
+      : isUpcoming
+      ? "🟡 Upcoming"
+      : staff.ended_early
+      ? "↩️ Returned Early"
+      : staff.ended_at
+      ? "✅ Completed"
+      : "🟢 Active";
+
+    const startUnix = isoToDiscordTimestamp(staff.start_date, { timeOfDay: "start" });
+    const endUnix = isoToDiscordTimestamp(staff.end_date, { timeOfDay: "noon" });
+
+    const lines = [
+      `# 🛠️ LOA Admin Details: ${cleanName}`,
+      `**Staff Member:** <@${staff.user_id}>`,
+      `**Status:** ${statusLabel}`,
+      `**Start Date:** <t:${startUnix}:D> (<t:${startUnix}:R>)`,
+      `**Expected Return:** <t:${endUnix}:D> (<t:${endUnix}:R>)`,
+      `**Time Remaining:** <t:${endUnix}:R>`,
+      `**Reason:** ${staff.reason || "*None provided*"}`,
+    ];
+
+    if (
+      staff.original_expected_return_date &&
+      staff.original_expected_return_date !== staff.end_date
+    ) {
+      lines.push(
+        `**Original Expected Return:** ${formatPrettyDate(staff.original_expected_return_date)}`
+      );
+    }
+
+    if (staff.notes) {
+      lines.push(`**Notes:** ${staff.notes}`);
+    }
+
+    if (staff.extensionHistory?.length > 0) {
+      const extLines = staff.extensionHistory.map((ext, idx) => {
+        return `- Extension ${idx + 1}: to **${formatPrettyDate(ext.newEndDate)}** by <@${ext.modifiedBy}> (${ext.reason || "no reason"})`;
+      });
+      lines.push(`**Extension History:**\n${extLines.join("\n")}`);
+    }
+
+    if (staff.reasonHistory?.length > 0) {
+      const reasonLines = staff.reasonHistory.map((r, idx) => {
+        return `- Edit ${idx + 1}: *"${r.previousReason}"* → *"${r.newReason}"* by <@${r.modifiedBy}>`;
+      });
+      lines.push(`**Reason History:**\n${reasonLines.join("\n")}`);
+    }
+
+    const savedRolesCount = (staff.removedRoleIds || []).length;
+    lines.push(`**Saved Staff Roles Snapshot:** ${savedRolesCount} role(s)`);
+
+    const innerComponents = [
+      createTextDisplay(lines.join("\n\n")),
+      createSeparator(true, 1),
+    ];
+
+    const isActionable = !staff.ended_at && !staff.ended_early && !staff.cancelled;
+    const adminButtons = [];
+
+    if (isActionable) {
+      adminButtons.push(
+        createButton({
+          customId: `${LoaCustomId.BTN_ADMIN_EXTEND_PREFIX}${staff.id}`,
+          label: "Extend LOA",
+          style: ButtonStyle.SECONDARY,
+          emoji: "⏳",
+        }),
+        createButton({
+          customId: `${LoaCustomId.BTN_ADMIN_END_PREFIX}${staff.id}`,
+          label: "End LOA",
+          style: ButtonStyle.DANGER,
+          emoji: "🛑",
+        })
+      );
+    }
+
+    adminButtons.push(
+      createButton({
+        customId: `${LoaCustomId.BTN_ADMIN_HISTORY_PREFIX}${staff.user_id}`,
+        label: "LOA History",
+        style: ButtonStyle.SECONDARY,
+        emoji: "📜",
+      }),
+      createButton({
+        customId: LoaCustomId.BTN_ACTIVE,
+        label: "Back to Active LOAs",
+        style: ButtonStyle.SECONDARY,
+        emoji: "📋",
+      })
+    );
+
+    innerComponents.push(createActionRow(adminButtons));
+    innerComponents.push(createSeparator(true, 1));
+    innerComponents.push(buildDamoFooter({ productName: "Staff LOA Manager" }));
+
+    return updateComponentsResponse([createContainer(innerComponents)]);
+  } catch (err) {
+    console.error("Error rendering admin LOA details:", err);
+    return ephemeralTextResponse(`❌ Error fetching details: ${err.message || "Internal error"}`);
+  }
+}
+
+/**
+ * Render complete previous LOA history with audit details and pagination.
+ *
+ * @param {Object} params
+ * @param {Object} params.stub
+ * @param {string} params.targetUserId
+ * @param {Object} params.env
+ * @param {Object} params.interaction
+ * @param {string} params.todayIso
+ * @param {number} [params.page=1]
+ * @returns {Promise<Response>}
+ */
+export async function renderLoaHistoryPanel({
+  stub,
+  targetUserId,
+  env,
+  interaction,
+  todayIso,
+  page = 1,
+}) {
+  try {
+    const isManager = canViewLoaHistory(interaction, env);
+    const userToQuery =
+      isManager && targetUserId
+        ? targetUserId
+        : interaction.member?.user?.id || interaction.user?.id;
+
+    const histRes = await stub.fetch(
+      `https://do/loa/history?userId=${encodeURIComponent(userToQuery)}`
+    );
+    const histData = await histRes.json();
+    const history = histData?.history || [];
+
+    if (history.length === 0) {
+      const container = createContainer([
+        createTextDisplay(`# 📜 LOA History: <@${userToQuery}>`),
+        createSeparator(true, 1),
+        createTextDisplay("No past or active Leave of Absence records found for this staff member."),
+        createSeparator(true, 1),
+        createActionRow([
+          createButton({
+            customId: LoaCustomId.BTN_STATUS,
+            label: "My LOA",
+            style: ButtonStyle.SECONDARY,
+            emoji: "👤",
+          }),
+          createButton({
+            customId: LoaCustomId.BTN_ACTIVE,
+            label: "View Active LOAs",
+            style: ButtonStyle.SECONDARY,
+            emoji: "📋",
+          }),
+        ]),
+        createSeparator(true, 1),
+        buildDamoFooter({ productName: "Staff LOA Manager" }),
+      ]);
+      return ephemeralComponentsResponse([container]);
+    }
+
+    const PAGE_SIZE = 3;
+    const totalPages = Math.max(1, Math.ceil(history.length / PAGE_SIZE));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const chunk = history.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+    const innerComponents = [
+      createTextDisplay(
+        `# 📜 Staff LOA History: <@${userToQuery}>\nShowing **${history.length}** total record${history.length === 1 ? "" : "s"} (Page ${currentPage} of ${totalPages})`
+      ),
+      createSeparator(true, 1),
+    ];
+
+    for (const rec of chunk) {
+      const isOverdue =
+        !rec.ended_at && !rec.ended_early && !rec.cancelled && rec.end_date < todayIso;
+      const isUpcoming = rec.start_date > todayIso && !rec.cancelled;
+      let badge = "🟢 Active";
+      if (rec.cancelled) badge = "⚪ Cancelled";
+      else if (rec.return_type === "EARLY_RETURN" || rec.ended_early)
+        badge = "↩️ Returned Early";
+      else if (rec.return_type === "ADMIN_ENDED") badge = "🛑 Ended by Admin";
+      else if (rec.ended_at) badge = "✅ Completed";
+      else if (isOverdue) badge = "🔴 OVERDUE";
+      else if (isUpcoming) badge = "🟡 Scheduled";
+
+      const startUnix = isoToDiscordTimestamp(rec.start_date, { timeOfDay: "start" });
+      const endUnix = isoToDiscordTimestamp(rec.end_date, { timeOfDay: "noon" });
+
+      const itemLines = [
+        `### ${badge} • <t:${startUnix}:D> → <t:${endUnix}:D>`,
+        `**Reason:** ${rec.reason || "*No reason provided*"}`,
+      ];
+
+      if (
+        rec.original_expected_return_date &&
+        rec.original_expected_return_date !== rec.end_date
+      ) {
+        itemLines.push(
+          `**Original Return Date:** ${formatPrettyDate(rec.original_expected_return_date)}`
+        );
+      }
+      if (rec.actual_return_at) {
+        itemLines.push(`**Actual Return:** ${rec.actual_return_at}`);
+      }
+      if (rec.notes) {
+        itemLines.push(`**Notes:** ${rec.notes}`);
+      }
+      if (rec.modified_by) {
+        itemLines.push(`**Last Modified By:** <@${rec.modified_by}>`);
+      }
+
+      innerComponents.push(createTextDisplay(itemLines.join("\n")));
+      innerComponents.push(createSeparator(true, 1));
+    }
+
+    // Pagination buttons
+    if (totalPages > 1) {
+      innerComponents.push(
+        createActionRow([
+          createButton({
+            customId: `${LoaCustomId.BTN_PAGE_HISTORY_PREFIX}${userToQuery}:${currentPage - 1}`,
+            label: "Previous",
+            style: ButtonStyle.SECONDARY,
+            disabled: currentPage <= 1,
+            emoji: "◀️",
+          }),
+          createButton({
+            customId: "noop_hist_page",
+            label: `Page ${currentPage} of ${totalPages}`,
+            style: ButtonStyle.SECONDARY,
+            disabled: true,
+          }),
+          createButton({
+            customId: `${LoaCustomId.BTN_PAGE_HISTORY_PREFIX}${userToQuery}:${currentPage + 1}`,
+            label: "Next",
+            style: ButtonStyle.SECONDARY,
+            disabled: currentPage >= totalPages,
+            emoji: "▶️",
+          }),
+        ])
+      );
+      innerComponents.push(createSeparator(true, 1));
+    }
+
+    innerComponents.push(
+      createActionRow([
+        createButton({
+          customId: LoaCustomId.BTN_STATUS,
+          label: "My LOA",
+          style: ButtonStyle.SECONDARY,
+          emoji: "👤",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_ACTIVE,
+          label: "View Active LOAs",
+          style: ButtonStyle.SECONDARY,
+          emoji: "📋",
+        }),
+      ])
+    );
+    innerComponents.push(createSeparator(true, 1));
+    innerComponents.push(buildDamoFooter({ productName: "Staff LOA Manager" }));
+
+    return ephemeralComponentsResponse([createContainer(innerComponents)]);
+  } catch (err) {
+    console.error("Error rendering LOA history:", err);
+    return ephemeralTextResponse(`❌ Error fetching history: ${err.message || "Internal error"}`);
+  }
+}
+
+/**
+ * Execute extending an active or scheduled LOA return date.
+ */
+export async function executeLoaExtend({
+  stub,
+  loaId,
+  newEndDateVal,
+  reasonVal = null,
+  userId,
+  displayName,
+  env,
+  todayIso,
+  customFetch = fetch,
+  ctx = null,
+}) {
+  if (!newEndDateVal) {
+    return ephemeralTextResponse("❌ Please provide a new return date.");
+  }
+  const parsed = parseAndValidateDate(newEndDateVal, todayIso);
+  if (!parsed.valid) {
+    return ephemeralTextResponse(
+      `❌ Invalid date: ${parsed.error || "Please enter a valid date (e.g. 9/20/2026)."}`
+    );
+  }
+  if (parsed.isoDate <= todayIso) {
+    return ephemeralTextResponse(
+      `❌ New return date must be in the future (after today, ${todayIso}).`
+    );
+  }
+
+  const extRes = await stub.fetch("https://do/loa/extend", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loaId,
+      newEndDate: parsed.isoDate,
+      reason: reasonVal ? reasonVal.trim() : null,
+      modifiedBy: userId,
+      modifiedAt: new Date().toISOString(),
+    }),
+  });
+
+  const extData = await extRes.json();
+  if (!extRes.ok || !extData.success) {
+    return ephemeralTextResponse(`❌ Failed to extend LOA: ${extData.error || "Unknown error"}`);
+  }
+
+  const loa = extData.loa;
+  const newEndUnix = isoToDiscordTimestamp(parsed.isoDate, { timeOfDay: "noon" });
+  const prevEndUnix = isoToDiscordTimestamp(
+    extData.previousEndDate || loa.original_expected_return_date || todayIso,
+    { timeOfDay: "noon" }
+  );
+
+  const backgroundTasks = async () => {
+    // Log to audit channel
+    await logLoaExtended({
+      env,
+      guildId: loa.guild_id,
+      userId: loa.user_id,
+      displayName: loa.display_name,
+      previousEndDate: extData.previousEndDate,
+      newEndDate: parsed.isoDate,
+      reason: reasonVal,
+      modifiedBy: userId,
+      customFetch,
+    }).catch(() => {});
+
+    // Send DM notification to the staff member
+    await sendDiscordDM({
+      env,
+      userId: loa.user_id,
+      content: `**Your LOA has been extended.**\n\n**New Expected Return:** <t:${newEndUnix}:D> (<t:${newEndUnix}:R>)\n**Previous Return Date:** <t:${prevEndUnix}:D>`,
+      customFetch,
+    }).catch(() => {});
+
+    // Refresh public list
+    await refreshPublicLoaList({
+      env,
+      guildId: loa.guild_id,
+      todayIso,
+      recentActivity: `⏳ ${loa.display_name}'s LOA was extended • just now`,
+      customFetch,
+      repost: false,
+      ctx,
+    }).catch(() => {});
+  };
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(backgroundTasks());
+  } else {
+    await backgroundTasks();
+  }
+
+  const container = createContainer([
+    createTextDisplay("# ⏳ Leave of Absence Extended"),
+    createTextDisplay(
+      `The expected return date has been updated.\n\n**Previous Return Date:** <t:${prevEndUnix}:D>\n**New Expected Return:** <t:${newEndUnix}:D> (<t:${newEndUnix}:R>)${reasonVal?.trim() ? `\n\n**Extension Reason:** ${reasonVal.trim()}` : ""}`
+    ),
+    createSeparator(true, 1),
+    buildDamoFooter({ productName: "Staff LOA Manager" }),
+  ]);
+
+  return ephemeralComponentsResponse([container]);
+}
+
+/**
+ * Execute updating an active or scheduled LOA reason.
+ */
+export async function executeLoaEditReason({
+  stub,
+  loaId,
+  newReasonVal,
+  userId,
+  displayName,
+  env,
+  todayIso,
+  customFetch = fetch,
+  ctx = null,
+}) {
+  const trimmed = (newReasonVal || "").trim();
+  if (!trimmed) {
+    return ephemeralTextResponse("❌ Reason cannot be empty.");
+  }
+
+  const editRes = await stub.fetch("https://do/loa/edit-reason", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loaId,
+      newReason: trimmed,
+      modifiedBy: userId,
+      modifiedAt: new Date().toISOString(),
+    }),
+  });
+
+  const editData = await editRes.json();
+  if (!editRes.ok || !editData.success) {
+    return ephemeralTextResponse(`❌ Failed to update reason: ${editData.error || "Unknown error"}`);
+  }
+
+  const loa = editData.loa;
+
+  const backgroundTasks = async () => {
+    // Log to audit channel
+    await logLoaReasonEdited({
+      env,
+      guildId: loa.guild_id,
+      userId: loa.user_id,
+      displayName: loa.display_name,
+      previousReason: editData.previousReason,
+      newReason: trimmed,
+      modifiedBy: userId,
+      customFetch,
+    }).catch(() => {});
+
+    // Refresh public list
+    await refreshPublicLoaList({
+      env,
+      guildId: loa.guild_id,
+      todayIso,
+      recentActivity: `✏️ ${loa.display_name} updated their LOA reason • just now`,
+      customFetch,
+      repost: false,
+      ctx,
+    }).catch(() => {});
+  };
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(backgroundTasks());
+  } else {
+    await backgroundTasks();
+  }
+
+  const container = createContainer([
+    createTextDisplay("# ✏️ LOA Reason Updated"),
+    createTextDisplay(
+      `Your Leave of Absence reason has been updated.\n\n**Updated Reason:**\n> ${trimmed}`
+    ),
+    createSeparator(true, 1),
+    buildDamoFooter({ productName: "Staff LOA Manager" }),
+  ]);
+
+  return ephemeralComponentsResponse([container]);
+}
+
+/**
+ * Execute administrator ending a staff member's LOA.
+ */
+export async function executeAdminEndLoa({
+  stub,
+  loaId,
+  adminUserId,
+  adminDisplayName,
+  env,
+  todayIso,
+  customFetch = fetch,
+  ctx = null,
+}) {
+  const histRes = await stub.fetch(`https://do/loa/history-all?limit=100`);
+  const histData = await histRes.json();
+  const loa = histData?.history?.find((l) => l.id === loaId);
+
+  if (!loa) {
+    return ephemeralTextResponse("❌ Could not find the specified LOA record.");
+  }
+
+  if (loa.ended_at || loa.ended_early || loa.cancelled) {
+    return ephemeralTextResponse("❌ This LOA has already ended or been cancelled.");
+  }
+
+  // Restore member nickname if modified
+  await restoreMemberNicknameAfterLoa({
+    env,
+    guildId: loa.guild_id,
+    userId: loa.user_id,
+    loa,
+    customFetch,
+  });
+
+  // Restore staff roles from snapshot
+  const restoreRes = await executeLoaRoleRestore({
+    env,
+    guildId: loa.guild_id,
+    userId: loa.user_id,
+    loaRecord: loa,
+    stub,
+    customFetch,
+  });
+
+  // Update in DO
+  const endRes = await stub.fetch("https://do/loa/admin-end", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loaId,
+      adminUserId,
+      endedAt: new Date().toISOString(),
+    }),
+  });
+
+  const endData = await endRes.json();
+  if (!endRes.ok || !endData.success) {
+    return ephemeralTextResponse(`❌ Failed to end LOA: ${endData.error || "Unknown error"}`);
+  }
+
+  const backgroundTasks = async () => {
+    await logLoaEnded({
+      env,
+      guildId: loa.guild_id,
+      userId: loa.user_id,
+      displayName: loa.display_name,
+      reasonText: `ended by administrator ${adminDisplayName} (<@${adminUserId}>)`,
+      restoredRoleIds: restoreRes.restoredRoleIds || [],
+      failedRestoreRoleIds: restoreRes.failedRestoreRoleIds || [],
+      isLegacy: restoreRes.isLegacy,
+      isProtectedStaff: Boolean(restoreRes.isProtectedStaff || loa.is_protected_staff),
+      customFetch,
+    }).catch(() => {});
+
+    if (restoreRes.failedRestoreRoleIds?.length > 0) {
+      await logLoaWarning({
+        env,
+        guildId: loa.guild_id,
+        userId: loa.user_id,
+        message: `Some roles could not be restored automatically for ${loa.display_name} (<@${loa.user_id}>) by admin <@${adminUserId}>: ${restoreRes.failedRestoreRoleIds.join(", ")}`,
+        customFetch,
+      }).catch(() => {});
+    }
+
+    // Send DM notification to staff member
+    await sendDiscordDM({
+      env,
+      userId: loa.user_id,
+      content: `**Your LOA has ended.**\n\nYour saved staff roles have been restored by administrator <@${adminUserId}>.`,
+      customFetch,
+    }).catch(() => {});
+
+    // Refresh public list
+    await refreshPublicLoaList({
+      env,
+      guildId: loa.guild_id,
+      todayIso,
+      recentActivity: `🛑 ${loa.display_name}'s LOA was ended by admin • just now`,
+      customFetch,
+      repost: true,
+      ctx,
+    }).catch(() => {});
+  };
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(backgroundTasks());
+  } else {
+    await backgroundTasks();
+  }
+
+  let returnMsg = `Successfully ended <@${loa.user_id}>'s Leave of Absence and restored their staff roles.`;
+  if (restoreRes.failedRestoreRoleIds?.length > 0) {
+    returnMsg += `\n\n⚠️ **Notice:** The following roles could not be restored automatically and may require manual assignment: ${restoreRes.failedRestoreRoleIds.map((r) => `<@&${r}>`).join(", ")}`;
+  }
+
+  const container = createContainer([
+    createTextDisplay("# 🛑 LOA Ended by Administrator"),
+    createTextDisplay(returnMsg),
+    createSeparator(true, 1),
+    buildDamoFooter({ productName: "Staff LOA Manager" }),
+  ]);
+
+  return updateComponentsResponse([container]);
 }
 
 /**
@@ -1913,6 +2876,14 @@ export async function handleLoaComponent(interaction, env, ctx) {
             required: true,
             maxLength: 500,
           }),
+          createTextInputRow({
+            customId: "notes",
+            label: "Additional Notes (Optional)",
+            style: 2, // Paragraph
+            placeholder: "Coverage notes, contact info, etc.",
+            required: false,
+            maxLength: 500,
+          }),
         ],
       });
     } catch (err) {
@@ -1922,11 +2893,250 @@ export async function handleLoaComponent(interaction, env, ctx) {
   }
 
   // 2. BUTTON: My LOA -> opens private ephemeral status panel with action controls
+  // 2. BUTTON: My LOA -> opens private ephemeral status panel with action controls
   if (customId === LoaCustomId.BTN_STATUS) {
     return await renderMyLoaPanel({ stub, userId, todayIso });
   }
 
-  // 3. BUTTON: Edit LOA -> looks up user's LOA and opens private edit modal
+  // 3. BUTTON: View Active LOAs -> displays sorted active & overdue dashboard
+  if (customId === LoaCustomId.BTN_ACTIVE) {
+    return await renderActiveLoasDashboard({
+      stub,
+      userId,
+      env,
+      interaction,
+      todayIso,
+      page: 0,
+    });
+  }
+
+  // 4. BUTTON: LOA History -> displays member/admin history
+  if (customId === LoaCustomId.BTN_HISTORY) {
+    return await renderLoaHistoryPanel({
+      stub,
+      targetUserId: userId,
+      env,
+      interaction,
+      todayIso,
+      page: 0,
+    });
+  }
+
+  // 5. BUTTON: Extend LOA (from My LOA)
+  if (customId === LoaCustomId.BTN_EXTEND) {
+    try {
+      const curRes = await stub.fetch(
+        `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
+      );
+      const curData = await curRes.json();
+      const existing = curData?.loa;
+
+      if (!existing) {
+        return ephemeralTextResponse("❌ You do not currently have an active or upcoming LOA to extend.");
+      }
+
+      return modalResponse({
+        title: "Extend Leave of Absence",
+        customId: `${LoaCustomId.MODAL_EXTEND_PREFIX}${existing.id}`,
+        components: [
+          createTextInputRow({
+            customId: "new_end_date",
+            label: "New Expected Return Date",
+            placeholder: "e.g. 9/25/2026 or 9/25",
+            required: true,
+          }),
+          createTextInputRow({
+            customId: "reason",
+            label: "Reason for Extension (Optional)",
+            style: 2, // Paragraph
+            placeholder: "Need additional time for personal reasons...",
+            required: false,
+            maxLength: 500,
+          }),
+        ],
+      });
+    } catch (err) {
+      console.error("Error opening LOA extend modal:", err);
+      return ephemeralTextResponse(`❌ Error preparing extend: ${err.message || "Internal error"}`);
+    }
+  }
+
+  // 6. BUTTON: Edit Reason (from My LOA)
+  if (customId === LoaCustomId.BTN_EDIT_REASON) {
+    try {
+      const curRes = await stub.fetch(
+        `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
+      );
+      const curData = await curRes.json();
+      const existing = curData?.loa;
+
+      if (!existing) {
+        return ephemeralTextResponse("❌ You do not currently have an active or upcoming LOA to edit.");
+      }
+
+      return modalResponse({
+        title: "Edit LOA Reason",
+        customId: `${LoaCustomId.MODAL_EDIT_REASON_PREFIX}${existing.id}`,
+        components: [
+          createTextInputRow({
+            customId: "reason",
+            label: "Updated Reason",
+            style: 2, // Paragraph
+            value: existing.reason || "",
+            placeholder: "Vacation / Personal / Work",
+            required: true,
+            maxLength: 500,
+          }),
+        ],
+      });
+    } catch (err) {
+      console.error("Error opening LOA edit reason modal:", err);
+      return ephemeralTextResponse(`❌ Error preparing edit reason: ${err.message || "Internal error"}`);
+    }
+  }
+
+  // 7. SELECT: Admin target from Active LOAs dropdown
+  if (customId === LoaCustomId.SELECT_ADMIN_TARGET) {
+    const selectedLoaId = interaction.data?.values?.[0];
+    if (!selectedLoaId) {
+      return ephemeralTextResponse("❌ Please select a staff member's LOA.");
+    }
+    return await renderAdminLoaDetailsPanel({
+      stub,
+      loaId: selectedLoaId,
+      env,
+      interaction,
+      todayIso,
+    });
+  }
+
+  // 8. BUTTON: Admin Extend LOA
+  if (customId.startsWith(LoaCustomId.BTN_ADMIN_EXTEND_PREFIX)) {
+    if (!canViewLoaHistory(interaction, env)) {
+      return ephemeralTextResponse("❌ Permission denied. Only Management and Owners can manage other staff members' LOAs.");
+    }
+    const loaId = customId.slice(LoaCustomId.BTN_ADMIN_EXTEND_PREFIX.length);
+    return modalResponse({
+      title: "Extend Staff Member LOA",
+      customId: `${LoaCustomId.MODAL_EXTEND_PREFIX}${loaId}`,
+      components: [
+        createTextInputRow({
+          customId: "new_end_date",
+          label: "New Expected Return Date",
+          placeholder: "e.g. 9/25/2026 or 9/25",
+          required: true,
+        }),
+        createTextInputRow({
+          customId: "reason",
+          label: "Reason for Extension (Optional)",
+          style: 2,
+          placeholder: "Extension authorized by management...",
+          required: false,
+          maxLength: 500,
+        }),
+      ],
+    });
+  }
+
+  // 9. BUTTON: Admin End LOA -> Confirmation dialog
+  if (customId.startsWith(LoaCustomId.BTN_ADMIN_END_PREFIX)) {
+    if (!canViewLoaHistory(interaction, env)) {
+      return ephemeralTextResponse("❌ Permission denied. Only Management and Owners can end other staff members' LOAs.");
+    }
+    const loaId = customId.slice(LoaCustomId.BTN_ADMIN_END_PREFIX.length);
+    const histRes = await stub.fetch(`https://do/loa/history-all?limit=100`);
+    const histData = await histRes.json();
+    const loa = histData?.history?.find((l) => l.id === loaId);
+
+    if (!loa) {
+      return ephemeralTextResponse("❌ Could not find the specified LOA record.");
+    }
+
+    const endSec = isoToDiscordTimestamp(loa.end_date, { timeOfDay: "noon" });
+    const dateDisplay = endSec ? `<t:${endSec}:D>` : formatPrettyDate(loa.end_date);
+
+    const confirmContainer = createContainer([
+      createTextDisplay("# 🛑 End Staff LOA?"),
+      createTextDisplay(
+        `Are you sure you want to end <@${loa.user_id}>'s Leave of Absence?\n\n**Expected Return:** ${dateDisplay}\n**Reason:** ${loa.reason}\n\nEnding their LOA will immediately restore their saved staff roles and remove the LOA role.`
+      ),
+      createSeparator(true, 1),
+      createActionRow([
+        createButton({
+          customId: LoaCustomId.CANCEL_DISMISS,
+          label: "Never Mind",
+          style: ButtonStyle.SECONDARY,
+        }),
+        createButton({
+          customId: `${LoaCustomId.CONFIRM_ADMIN_END_PREFIX}${loaId}`,
+          label: "Confirm End LOA",
+          style: ButtonStyle.DANGER,
+        }),
+      ]),
+    ]);
+
+    return ephemeralComponentsResponse([confirmContainer]);
+  }
+
+  // 10. BUTTON: Confirm Admin End LOA
+  if (customId.startsWith(LoaCustomId.CONFIRM_ADMIN_END_PREFIX)) {
+    if (!canViewLoaHistory(interaction, env)) {
+      return ephemeralTextResponse("❌ Permission denied. Only Management and Owners can end other staff members' LOAs.");
+    }
+    const loaId = customId.slice(LoaCustomId.CONFIRM_ADMIN_END_PREFIX.length);
+    return await executeAdminEndLoa({
+      stub,
+      loaId,
+      adminUserId: userId,
+      adminDisplayName: displayName,
+      env,
+      todayIso,
+      ctx,
+    });
+  }
+
+  // 11. BUTTON: Admin View History
+  if (customId.startsWith(LoaCustomId.BTN_ADMIN_HISTORY_PREFIX)) {
+    const targetUserId = customId.slice(LoaCustomId.BTN_ADMIN_HISTORY_PREFIX.length);
+    return await renderLoaHistoryPanel({
+      stub,
+      targetUserId,
+      env,
+      interaction,
+      todayIso,
+      page: 0,
+    });
+  }
+
+  // 12. BUTTON: Active LOAs Pagination
+  if (customId.startsWith(LoaCustomId.BTN_PAGE_ACTIVE_PREFIX)) {
+    const page = parseInt(customId.slice(LoaCustomId.BTN_PAGE_ACTIVE_PREFIX.length), 10) || 0;
+    return await renderActiveLoasDashboard({
+      stub,
+      userId,
+      env,
+      interaction,
+      todayIso,
+      page,
+    });
+  }
+
+  // 13. BUTTON: LOA History Pagination
+  if (customId.startsWith(LoaCustomId.BTN_PAGE_HISTORY_PREFIX)) {
+    const payload = customId.slice(LoaCustomId.BTN_PAGE_HISTORY_PREFIX.length);
+    const [targetUserId, pageStr] = payload.split(":");
+    const page = parseInt(pageStr, 10) || 0;
+    return await renderLoaHistoryPanel({
+      stub,
+      targetUserId: targetUserId || userId,
+      env,
+      interaction,
+      todayIso,
+      page,
+    });
+  }
+
+  // 14. BUTTON: Edit LOA (legacy full edit) -> looks up user's LOA and opens private edit modal
   if (customId === LoaCustomId.BTN_EDIT) {
     try {
       const curRes = await stub.fetch(
@@ -1974,7 +3184,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
   }
 
-  // 4. BUTTON: Cancel / Return Early -> shows private confirmation dialog
+  // 15. BUTTON: Cancel / Return Early -> shows private confirmation dialog
   if (customId === LoaCustomId.BTN_CANCEL) {
     try {
       const curRes = await stub.fetch(
@@ -2005,7 +3215,6 @@ export async function handleLoaComponent(interaction, env, ctx) {
               customId: `${LoaCustomId.CONFIRM_CANCEL_PREFIX}${existing.id}`,
               label: "Cancel LOA",
               style: ButtonStyle.DANGER,
-              emoji: "❌",
             }),
           ]),
         ]);
@@ -2013,25 +3222,26 @@ export async function handleLoaComponent(interaction, env, ctx) {
         return ephemeralComponentsResponse([confirmContainer]);
       }
 
-      // Case B: ACTIVE LOA -> Confirmation dialog to return early
-      if (todayIso >= existing.start_date && todayIso <= existing.end_date) {
+      // Case B: ACTIVE or OVERDUE LOA -> Confirmation dialog to return early
+      if (todayIso >= existing.start_date) {
+        const endSec = isoToDiscordTimestamp(existing.end_date, { timeOfDay: "noon" });
+        const dateDisplay = endSec ? `<t:${endSec}:D>` : formatPrettyDate(existing.end_date);
         const confirmContainer = createContainer([
-          createTextDisplay("# ⚠️ Return Early?"),
+          createTextDisplay("# ⚠️ Return Early?\n**Return from LOA early?**"),
           createTextDisplay(
-            `**Current LOA**\n${formatPrettyDateRange(existing.start_date, existing.end_date)}\n\n**Reason**\n> ${existing.reason}\n\nYour original return date is ${formatPrettyDate(existing.end_date)}.`
+            `Your expected return date was:\n${dateDisplay}\n\nYour original return date is ${formatPrettyDate(existing.end_date)}.\n\nReturning early will restore your saved staff roles and remove the LOA role.`
           ),
           createSeparator(true, 1),
           createActionRow([
             createButton({
               customId: LoaCustomId.CANCEL_DISMISS,
-              label: "Never Mind",
+              label: "Cancel",
               style: ButtonStyle.SECONDARY,
             }),
             createButton({
               customId: `${LoaCustomId.CONFIRM_RETURN_PREFIX}${existing.id}`,
-              label: "I'm Back",
+              label: "Confirm Return",
               style: ButtonStyle.SUCCESS,
-              emoji: "✅",
             }),
           ]),
         ]);
@@ -2046,7 +3256,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
   }
 
-  // 5. BUTTON: Refresh -> rebuilds/patches permanent dashboard
+  // 16. BUTTON: Refresh -> rebuilds/patches permanent dashboard
   if (customId === LoaCustomId.BTN_REFRESH) {
     try {
       await refreshPublicLoaList({ env, guildId, todayIso, repost: false, ctx });
@@ -2057,12 +3267,12 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
   }
 
-  // 6. BUTTON: Return Alerts -> opens private subscription panel
+  // 17. BUTTON: Return Alerts -> opens private subscription panel
   if (customId === LoaCustomId.BTN_ALERTS) {
     return await renderReturnAlertsPanel({ stub, userId, guildId, todayIso });
   }
 
-  // 7. BUTTON: Toggle Return Alert
+  // 18. BUTTON: Toggle Return Alert
   if (customId.startsWith(LoaCustomId.ALERT_TOGGLE_PREFIX)) {
     const loaId = customId.slice(LoaCustomId.ALERT_TOGGLE_PREFIX.length);
     try {
@@ -2079,7 +3289,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
   }
 
-  // 8. BUTTON: Never Mind (Dismiss confirmation dialog)
+  // 19. BUTTON: Never Mind / Cancel (Dismiss confirmation dialog)
   if (customId === LoaCustomId.CANCEL_DISMISS) {
     const container = createContainer([
       createTextDisplay("Action cancelled. No changes were made."),
@@ -2087,7 +3297,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
     return updateComponentsResponse([container]);
   }
 
-  // 9. BUTTON: Confirm Cancel (Upcoming LOA)
+  // 20. BUTTON: Confirm Cancel (Upcoming LOA)
   if (customId.startsWith(LoaCustomId.CONFIRM_CANCEL_PREFIX)) {
     const loaId = customId.slice(LoaCustomId.CONFIRM_CANCEL_PREFIX.length);
     try {
@@ -2102,14 +3312,24 @@ export async function handleLoaComponent(interaction, env, ctx) {
       }
 
       const activityText = `❌ ${displayName} cancelled their upcoming LOA • just now`;
-      await refreshPublicLoaList({
-        env,
-        guildId,
-        todayIso,
-        recentActivity: activityText,
-        repost: true,
-        ctx,
-      });
+      const refreshTask = async () => {
+        await refreshPublicLoaList({
+          env,
+          guildId,
+          todayIso,
+          recentActivity: activityText,
+          repost: true,
+          ctx,
+        }).catch((err) => {
+          console.warn("Failed to refresh public LOA list:", err);
+        });
+      };
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(refreshTask());
+      } else {
+        await refreshTask();
+      }
 
       const container = createContainer([
         createTextDisplay("# ❌ Leave of Absence Cancelled"),
@@ -2127,7 +3347,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
   }
 
-  // 10. BUTTON: Confirm Return Early (Active LOA)
+  // 21. BUTTON: Confirm Return Early (Active LOA)
   if (customId.startsWith(LoaCustomId.CONFIRM_RETURN_PREFIX)) {
     if (loaConfig.settings?.allowEarlyEnd === false) {
       return ephemeralTextResponse(
@@ -2136,30 +3356,54 @@ export async function handleLoaComponent(interaction, env, ctx) {
     }
     const loaId = customId.slice(LoaCustomId.CONFIRM_RETURN_PREFIX.length);
     try {
-      // Look up existing LOA record to restore nickname
+      // Look up existing LOA record to restore nickname & roles
       const curRes = await stub.fetch(
         `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
       );
       const curData = await curRes.json();
-      const existing = curData?.loa;
+      let existing = curData?.loa;
 
-      if (existing) {
-        await restoreMemberNicknameAfterLoa({
-          env,
-          guildId,
-          userId,
-          loa: existing,
-        });
+      if (!existing && loaId) {
+        const histRes = await stub.fetch(`https://do/loa/history-all?limit=50`);
+        const histData = await histRes.json();
+        existing = histData?.history?.find((l) => l.id === loaId);
+      }
 
-        // Restore staff roles from snapshot
-        const restoreRes = await executeLoaRoleRestore({
-          env,
-          guildId,
-          userId,
-          loaRecord: existing,
-          stub,
-        });
+      if (!existing) {
+        return ephemeralTextResponse("❌ You do not currently have an active Leave of Absence.");
+      }
 
+      if (existing.ended_early || existing.ended_at || existing.cancelled) {
+        return ephemeralTextResponse("❌ This Leave of Absence has already ended.");
+      }
+
+      await restoreMemberNicknameAfterLoa({
+        env,
+        guildId,
+        userId,
+        loa: existing,
+      });
+
+      // Restore staff roles from snapshot
+      const restoreRes = await executeLoaRoleRestore({
+        env,
+        guildId,
+        userId,
+        loaRecord: existing,
+        stub,
+      });
+
+      const endRes = await stub.fetch("https://do/loa/end-early", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loaId, userId }),
+      });
+      const endData = await endRes.json();
+      if (!endRes.ok || !endData.success) {
+        return ephemeralTextResponse(`❌ Failed to end LOA early: ${endData.error || "Unknown error"}`);
+      }
+
+      const backgroundTasks = async () => {
         await logLoaEnded({
           env,
           guildId,
@@ -2182,31 +3426,40 @@ export async function handleLoaComponent(interaction, env, ctx) {
             message: `Some roles could not be restored automatically for ${displayName} (<@${userId}>): ${restoreRes.failedRestoreRoleIds.join(", ")}`,
           }).catch(() => {});
         }
+
+        // Send safe DM notification on return early
+        await sendDiscordDM({
+          env,
+          userId,
+          content: "**You have returned from LOA early.**\n\nYour staff roles have been restored. Welcome back!",
+        }).catch(() => {});
+
+        const activityText = `✅ ${displayName} returned from LOA early • just now`;
+        await refreshPublicLoaList({
+          env,
+          guildId,
+          todayIso,
+          recentActivity: activityText,
+          repost: true,
+          ctx,
+        }).catch((err) => {
+          console.warn("Failed to refresh public LOA list:", err);
+        });
+      };
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(backgroundTasks());
+      } else {
+        await backgroundTasks();
       }
 
-      const endRes = await stub.fetch("https://do/loa/end-early", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ loaId, userId }),
-      });
-      const endData = await endRes.json();
-      if (!endRes.ok || !endData.success) {
-        return ephemeralTextResponse(`❌ Failed to end LOA early: ${endData.error || "Unknown error"}`);
-      }
-
-      const activityText = `✅ ${displayName} returned from LOA early • just now`;
-      await refreshPublicLoaList({
-        env,
-        guildId,
-        todayIso,
-        recentActivity: activityText,
-        repost: true,
-        ctx,
-      });
-
-      const returnMsg = (existing?.is_protected_staff || existing?.isProtectedStaff)
+      let returnMsg = (existing?.is_protected_staff || existing?.isProtectedStaff)
         ? "Your Leave of Absence has ended early and your nickname has been restored. Welcome back!"
         : "Your Leave of Absence has ended early and your staff roles have been restored. Welcome back!";
+
+      if (restoreRes.failedRestoreRoleIds?.length > 0) {
+        returnMsg += `\n\n⚠️ **Notice:** The following roles could not be restored automatically and may require manual assignment: ${restoreRes.failedRestoreRoleIds.map((r) => `<@&${r}>`).join(", ")}`;
+      }
 
       const container = createContainer([
         createTextDisplay("# ✅ Welcome Back"),
@@ -2229,7 +3482,7 @@ export async function handleLoaComponent(interaction, env, ctx) {
 }
 
 /**
- * Handle Modal submit interactions for LOA start and edit.
+ * Handle Modal submit interactions for LOA start, edit, extend, and reason edit.
  *
  * @param {Object} interaction
  * @param {Object} env
@@ -2249,6 +3502,7 @@ export async function handleLoaModalSubmit(interaction, env, ctx) {
   const startDateVal = values.start_date;
   const endDateVal = values.end_date;
   const reasonVal = values.reason;
+  const notesVal = values.notes;
 
   // 1. MODAL: Start LOA
   if (customId === LoaCustomId.MODAL_START) {
@@ -2261,6 +3515,7 @@ export async function handleLoaModalSubmit(interaction, env, ctx) {
       startDateVal,
       endDateVal,
       reasonVal,
+      notesVal,
       todayIso,
       stub,
       ctx,
@@ -2268,8 +3523,42 @@ export async function handleLoaModalSubmit(interaction, env, ctx) {
     });
   }
 
-  // 2. MODAL: Edit LOA
-  if (customId.startsWith(LoaCustomId.MODAL_EDIT_PREFIX)) {
+  // 2. MODAL: Extend LOA
+  if (customId.startsWith(LoaCustomId.MODAL_EXTEND_PREFIX)) {
+    const loaId = customId.slice(LoaCustomId.MODAL_EXTEND_PREFIX.length);
+    const newEndDateVal = values.new_end_date;
+    const reason = values.reason;
+    return await executeLoaExtend({
+      stub,
+      loaId,
+      newEndDateVal,
+      reasonVal: reason,
+      userId,
+      displayName,
+      env,
+      todayIso,
+      ctx,
+    });
+  }
+
+  // 3. MODAL: Edit Reason
+  if (customId.startsWith(LoaCustomId.MODAL_EDIT_REASON_PREFIX)) {
+    const loaId = customId.slice(LoaCustomId.MODAL_EDIT_REASON_PREFIX.length);
+    const newReasonVal = values.reason;
+    return await executeLoaEditReason({
+      stub,
+      loaId,
+      newReasonVal,
+      userId,
+      displayName,
+      env,
+      todayIso,
+      ctx,
+    });
+  }
+
+  // 4. MODAL: Edit LOA (legacy full edit)
+  if (customId.startsWith(`${LoaCustomId.MODAL_EDIT_PREFIX}:`) || customId === LoaCustomId.MODAL_EDIT_PREFIX) {
     return await executeLoaEdit({
       env,
       guildId,

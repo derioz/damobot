@@ -128,5 +128,6 @@ export const loaConfig = {
     maximumDays: 30, // Maximum allowable LOA duration in a single request
     allowEarlyEnd: true, // Whether staff can return early and end their own LOA
     allowEdit: true, // Whether staff can edit dates or reason of an existing active LOA
+    autoRestoreOnExpiry: false, // Whether cron automatically restores roles on expiry (if false, LOA stays active as OVERDUE until ended)
   },
 };

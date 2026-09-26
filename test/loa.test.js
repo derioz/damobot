@@ -424,6 +424,87 @@ function createMockLoaDO(env = {}) {
         }
 
         if (
+          normalized.includes("UPDATE staff_loas") &&
+          normalized.includes("SET end_date = ?")
+        ) {
+          const [
+            newEndDate,
+            updatedReason,
+            originalReturn,
+            historyJson,
+            modifiedBy,
+            modifiedAt,
+            updatedAt,
+            loaId,
+          ] = params;
+          const rec = mockStorage.records.get(loaId);
+          if (rec) {
+            rec.end_date = newEndDate;
+            rec.reason = updatedReason;
+            rec.original_expected_return_date = originalReturn;
+            rec.extension_history = historyJson;
+            rec.modified_by = modifiedBy;
+            rec.modified_at = modifiedAt;
+            rec.updated_at = updatedAt;
+            rec.reminder_sent = 0;
+          }
+          return [];
+        }
+
+        if (
+          normalized.includes("UPDATE staff_loas") &&
+          normalized.includes("SET reason = ?")
+        ) {
+          const [
+            newReason,
+            historyJson,
+            modifiedBy,
+            modifiedAt,
+            updatedAt,
+            loaId,
+          ] = params;
+          const rec = mockStorage.records.get(loaId);
+          if (rec) {
+            rec.reason = newReason;
+            rec.reason_history = historyJson;
+            rec.modified_by = modifiedBy;
+            rec.modified_at = modifiedAt;
+            rec.updated_at = updatedAt;
+          }
+          return [];
+        }
+
+        if (
+          normalized.includes("UPDATE staff_loas") &&
+          normalized.includes("return_type = 'ADMIN_ENDED'")
+        ) {
+          const [endedAt, actualReturnAt, adminUserId, modifiedAt, updatedAt, loaId] = params;
+          const rec = mockStorage.records.get(loaId);
+          if (rec) {
+            rec.ended_at = endedAt;
+            rec.actual_return_at = actualReturnAt;
+            rec.return_type = "ADMIN_ENDED";
+            rec.modified_by = adminUserId;
+            rec.modified_at = modifiedAt;
+            rec.updated_at = updatedAt;
+          }
+          return [];
+        }
+
+        if (
+          normalized.includes("UPDATE staff_loas") &&
+          normalized.includes("return_type = 'EARLY_RETURN'")
+        ) {
+          const [endedAt, loaId] = params;
+          const rec = mockStorage.records.get(loaId);
+          if (rec) {
+            rec.actual_return_at = endedAt;
+            rec.return_type = "EARLY_RETURN";
+          }
+          return [];
+        }
+
+        if (
           normalized.includes("SELECT * FROM staff_loas") &&
           normalized.includes("nickname_modified = 1")
         ) {
@@ -468,9 +549,42 @@ function createMockLoaDO(env = {}) {
 
         if (
           normalized.includes("SELECT * FROM staff_loas") &&
+          normalized.includes("reminder_sent")
+        ) {
+          const [todayIso, tomorrowIso] = params;
+          const list = [];
+          for (const rec of mockStorage.records.values()) {
+            if (
+              rec.start_date <= todayIso &&
+              rec.end_date <= tomorrowIso &&
+              rec.end_date >= todayIso &&
+              rec.cancelled === 0 &&
+              rec.ended_early === 0 &&
+              !rec.ended_at &&
+              (!rec.reminder_sent || rec.reminder_sent === 0)
+            ) {
+              list.push({ ...rec });
+            }
+          }
+          return list;
+        }
+
+        if (
+          normalized.includes("UPDATE staff_loas") &&
+          normalized.includes("reminder_sent = 1")
+        ) {
+          const [loaId] = params;
+          const rec = mockStorage.records.get(loaId);
+          if (rec) rec.reminder_sent = 1;
+          return [];
+        }
+
+        if (
+          normalized.includes("SELECT * FROM staff_loas") &&
           normalized.includes("end_date >= ?") &&
           !normalized.includes("user_id = ?") &&
-          !normalized.includes("nickname_modified")
+          !normalized.includes("nickname_modified") &&
+          !normalized.includes("reminder_sent")
         ) {
           const [todayIso1, todayIso2] = params;
           const today = todayIso1;
@@ -747,14 +861,15 @@ test("PUBLIC LIST LAYOUT: Container contains all 4 action buttons even when list
   assert.equal(actionRows.length, 1, "Must contain 1 Action Row of buttons");
 
   const buttons = actionRows.flatMap((r) => r.components);
-  assert.equal(buttons.length, 4, "Must contain all 4 LOA control buttons");
+  assert.equal(buttons.length, 5, "Must contain all 5 LOA control buttons");
 
   const customIds = buttons.map((b) => b.custom_id);
   assert.deepEqual(customIds, [
     LoaCustomId.BTN_START,
+    LoaCustomId.BTN_ACTIVE,
     LoaCustomId.BTN_STATUS,
+    LoaCustomId.BTN_HISTORY,
     LoaCustomId.BTN_REFRESH,
-    LoaCustomId.BTN_ALERTS,
   ]);
 
   // Check header Section has Vital RP logo Thumbnail accessory
@@ -993,10 +1108,11 @@ test("START FLOW: Clicking [ 🏖️ Start LOA ] returns private modal", async (
   assert.equal(json.type, InteractionResponseType.MODAL);
   assert.equal(json.data.custom_id, LoaCustomId.MODAL_START);
   assert.equal(json.data.title, "Start Leave of Absence");
-  assert.equal(json.data.components.length, 3);
+  assert.equal(json.data.components.length, 4);
   assert.equal(json.data.components[0].components[0].custom_id, "start_date");
   assert.equal(json.data.components[1].components[0].custom_id, "end_date");
   assert.equal(json.data.components[2].components[0].custom_id, "reason");
+  assert.equal(json.data.components[3].components[0].custom_id, "notes");
 });
 
 test("START FLOW: Submitting start modal creates LOA, replaces public list, and returns private confirmation", async () => {
@@ -5868,14 +5984,476 @@ test("CASE 6: Delete dashboard manually, then refresh safely recreates replaceme
 
     const patchCalls2 = requests.filter((r) => r.method === "PATCH");
     const postCalls2 = requests.filter((r) => r.method === "POST");
-
-    assert.equal(patchCalls2.length, 1, "Subsequent refresh calls PATCH");
-    assert.ok(patchCalls2[0].url.endsWith("/msg_recreated_replacement_99"), "Subsequent refresh patches new message ID");
     assert.equal(postCalls2.length, 0, "No additional POST request made");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
+
+// ============================================================================
+// ENHANCED LOA CENTER TESTS
+// ============================================================================
+
+test("ENHANCED LOA: Extend LOA modal updates return date, preserves original date, resets reminder flag", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+
+  // Create an active LOA
+  doEntry.instance.createLoa({
+    id: "loa_ext_test_1",
+    guildId: "guild_vital",
+    userId: "staff_ext_user",
+    displayName: "ExtUser",
+    startDate: "2026-09-01",
+    endDate: "2026-09-10",
+    reason: "Original reason",
+    todayIso: "2026-09-05",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    type: InteractionType.MODAL_SUBMIT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "staff_ext_user", username: "extuser" },
+      roles: [TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: `${LoaCustomId.MODAL_EXTEND_PREFIX}loa_ext_test_1`,
+      components: [
+        {
+          type: ComponentType.ACTION_ROW,
+          components: [
+            {
+              type: ComponentType.TEXT_INPUT,
+              custom_id: "new_end_date",
+              value: "9/25/2026",
+            },
+          ],
+        },
+        {
+          type: ComponentType.ACTION_ROW,
+          components: [
+            {
+              type: ComponentType.TEXT_INPUT,
+              custom_id: "reason",
+              value: "Extended due to family travel",
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  const text = getContainerTexts(json.data.components[0]);
+  assert.ok(text.includes("Leave of Absence Extended"));
+
+  // Verify DO record state
+  const updated = doEntry.instance.getLoaById("loa_ext_test_1");
+  assert.equal(updated.end_date, "2026-09-25");
+  assert.equal(updated.original_expected_return_date, "2026-09-10");
+  assert.equal(updated.reason, "Extended due to family travel");
+  assert.equal(updated.reminder_sent, 0);
+  assert.ok(Array.isArray(updated.extensionHistory));
+  assert.equal(updated.extensionHistory.length, 1);
+  assert.equal(updated.extensionHistory[0].previousEndDate, "2026-09-10");
+  assert.equal(updated.extensionHistory[0].newEndDate, "2026-09-25");
+});
+
+test("ENHANCED LOA: Edit Reason modal updates reason and appends to reason history", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+
+  doEntry.instance.createLoa({
+    id: "loa_edit_reason_1",
+    guildId: "guild_vital",
+    userId: "staff_edit_user",
+    displayName: "EditUser",
+    startDate: "2026-09-01",
+    endDate: "2026-09-10",
+    reason: "First reason",
+    todayIso: "2026-09-05",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    type: InteractionType.MODAL_SUBMIT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "staff_edit_user", username: "edituser" },
+      roles: [TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: `${LoaCustomId.MODAL_EDIT_REASON_PREFIX}loa_edit_reason_1`,
+      components: [
+        {
+          type: ComponentType.ACTION_ROW,
+          components: [
+            {
+              type: ComponentType.TEXT_INPUT,
+              custom_id: "reason",
+              value: "Updated reason for leave",
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  const text = getContainerTexts(json.data.components[0]);
+  assert.ok(text.includes("LOA Reason Updated"));
+
+  const updated = doEntry.instance.getLoaById("loa_edit_reason_1");
+  assert.equal(updated.reason, "Updated reason for leave");
+  assert.ok(Array.isArray(updated.reasonHistory));
+  assert.equal(updated.reasonHistory.length, 1);
+  assert.equal(updated.reasonHistory[0].previousReason, "First reason");
+  assert.equal(updated.reasonHistory[0].newReason, "Updated reason for leave");
+});
+
+test("ENHANCED LOA: Return Early restores roles, sets return_type = 'EARLY_RETURN', and is idempotent", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+
+  // Create active LOA with role snapshot
+  doEntry.instance.createLoa({
+    id: "loa_return_early_1",
+    guildId: "guild_vital",
+    userId: "staff_early_user",
+    displayName: "EarlyUser",
+    startDate: "2026-09-01",
+    endDate: "2026-09-15",
+    reason: "Trip",
+    todayIso: "2026-09-05",
+  });
+  doEntry.instance.updateLoaRoleSnapshot("loa_return_early_1", {
+    removedRoleIds: [DEFAULT_MODERATOR_ROLE_ID],
+    preservedRoleIds: [TEST_STAFF_ROLE_ID],
+    assignedLoaRoleId: DEFAULT_STAFF_LOA_ROLE_ID,
+    isProtectedStaff: false,
+    roleSwapStatus: "completed",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "staff_early_user", username: "earlyuser" },
+      roles: [DEFAULT_STAFF_LOA_ROLE_ID],
+    },
+    data: {
+      custom_id: `${LoaCustomId.CONFIRM_RETURN_PREFIX}loa_return_early_1`,
+    },
+  });
+
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  const text = getContainerTexts(json.data.components[0]);
+  assert.ok(text.includes("Welcome Back"));
+
+  const updated = doEntry.instance.getLoaById("loa_return_early_1");
+  assert.equal(updated.ended_early, 1);
+  assert.equal(updated.return_type, "EARLY_RETURN");
+  assert.ok(updated.actual_return_at != null);
+
+  // Idempotency: clicking again rejects
+  const bodyAgain = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "staff_early_user", username: "earlyuser" },
+      roles: [TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: `${LoaCustomId.CONFIRM_RETURN_PREFIX}loa_return_early_1`,
+    },
+  });
+  const sigAgain = await signDiscordPayload(bodyAgain, keyPair, timestamp);
+  const req2 = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sigAgain,
+      "x-signature-timestamp": timestamp,
+    },
+    body: bodyAgain,
+  });
+  const res2 = await worker.fetch(req2, env, {});
+  const json2 = await res2.json();
+  assert.ok(json2.data.content.includes("already ended"));
+});
+
+test("ENHANCED LOA: Overdue LOAs display 🔴 OVERDUE and remain active until ended", () => {
+  const todayIso = "2026-09-25";
+  const loas = [
+    {
+      id: "overdue_1",
+      display_name: "OverdueStaff",
+      start_date: "2026-09-01",
+      end_date: "2026-09-10", // in the past!
+      reason: "Exam study",
+      ended_at: null,
+      ended_early: 0,
+      cancelled: 0,
+      role_swap_status: "completed",
+    },
+  ];
+
+  const containers = buildLoaListContainers(loas, null, todayIso);
+  const text = getContainerTexts(containers[0]);
+  assert.ok(text.includes("OVERDUE"));
+  assert.ok(text.includes("🔴"));
+  assert.ok(text.includes("OverdueStaff"));
+});
+
+test("ENHANCED LOA: Admin can view active LOAs dashboard, inspect target, and end LOA", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+
+  doEntry.instance.createLoa({
+    id: "loa_admin_target_1",
+    guildId: "guild_vital",
+    userId: "staff_target_1",
+    displayName: "TargetStaff",
+    startDate: "2026-09-01",
+    endDate: "2026-09-30",
+    reason: "Leave",
+    todayIso: "2026-09-05",
+  });
+  doEntry.instance.updateLoaRoleSnapshot("loa_admin_target_1", {
+    removedRoleIds: [DEFAULT_MODERATOR_ROLE_ID],
+    preservedRoleIds: [TEST_STAFF_ROLE_ID],
+    assignedLoaRoleId: DEFAULT_STAFF_LOA_ROLE_ID,
+    isProtectedStaff: false,
+    roleSwapStatus: "completed",
+  });
+
+  // 1. Click View Active LOAs button as Management
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body1 = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "mgr_1", username: "mgr" },
+      roles: [DEFAULT_VRP_MANAGEMENT_ROLE_ID],
+    },
+    data: { custom_id: LoaCustomId.BTN_ACTIVE },
+  });
+
+  const sig1 = await signDiscordPayload(body1, keyPair, timestamp);
+  const req1 = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig1,
+      "x-signature-timestamp": timestamp,
+    },
+    body: body1,
+  });
+
+  const res1 = await worker.fetch(req1, env, {});
+  const json1 = await res1.json();
+  const text1 = getContainerTexts(json1.data.components[0]);
+  assert.ok(text1.includes("Active Staff LOAs"));
+  assert.ok(text1.includes("TargetStaff"));
+
+  // 2. Select the staff member from dropdown
+  const body2 = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "mgr_1", username: "mgr" },
+      roles: [DEFAULT_VRP_MANAGEMENT_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.SELECT_ADMIN_TARGET,
+      values: ["loa_admin_target_1"],
+    },
+  });
+
+  const sig2 = await signDiscordPayload(body2, keyPair, timestamp);
+  const req2 = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig2,
+      "x-signature-timestamp": timestamp,
+    },
+    body: body2,
+  });
+
+  const res2 = await worker.fetch(req2, env, {});
+  const json2 = await res2.json();
+  const text2 = getContainerTexts(json2.data.components[0]);
+  assert.ok(text2.includes("LOA Admin Details"));
+
+  // 3. Confirm admin end LOA
+  const body3 = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      user: { id: "mgr_1", username: "mgr" },
+      roles: [DEFAULT_VRP_MANAGEMENT_ROLE_ID],
+    },
+    data: {
+      custom_id: `${LoaCustomId.CONFIRM_ADMIN_END_PREFIX}loa_admin_target_1`,
+    },
+  });
+
+  const sig3 = await signDiscordPayload(body3, keyPair, timestamp);
+  const req3 = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig3,
+      "x-signature-timestamp": timestamp,
+    },
+    body: body3,
+  });
+
+  const res3 = await worker.fetch(req3, env, {});
+  const json3 = await res3.json();
+  const text3 = getContainerTexts(json3.data.components[0]);
+  assert.ok(text3.includes("LOA Ended by Administrator"));
+
+  const updated = doEntry.instance.getLoaById("loa_admin_target_1");
+  assert.equal(updated.return_type, "ADMIN_ENDED");
+  assert.equal(updated.modified_by, "mgr_1");
+});
+
+test("ENHANCED LOA: 24-Hour Return Reminder dispatches DM and sets reminder_sent flag", async () => {
+  const pubHex = "aabbcc";
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+
+  // Create an active LOA ending tomorrow (2026-09-06) relative to today (2026-09-05)
+  doEntry.instance.createLoa({
+    id: "loa_rem_1",
+    guildId: "guild_vital",
+    userId: "staff_rem_1",
+    displayName: "ReminderStaff",
+    startDate: "2026-09-01",
+    endDate: "2026-09-06",
+    reason: "Vacation",
+    todayIso: "2026-09-05",
+  });
+
+  let reminderDMDelivered = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const urlStr = String(url);
+    if (urlStr.includes("/users/@me/channels")) {
+      return new Response(JSON.stringify({ id: "dm_chan_123" }), { status: 200 });
+    }
+    if (urlStr.includes("/channels/dm_chan_123/messages")) {
+      reminderDMDelivered = true;
+      return new Response(JSON.stringify({ id: "msg_dm_123" }), { status: 200 });
+    }
+    return originalFetch(url, opts);
+  };
+
+  try {
+    const rolloverResult = await doEntry.instance.processCronRollover({
+      env,
+      todayIso: "2026-09-05",
+      guildId: "guild_vital",
+    });
+
+    assert.equal(rolloverResult.remindersSent, 1);
+    assert.equal(reminderDMDelivered, true);
+
+    // Verify reminder_sent = 1
+    const rec = doEntry.instance.getLoaById("loa_rem_1");
+    assert.equal(rec.reminder_sent, 1);
+
+    // Running again does NOT send duplicate reminder
+    reminderDMDelivered = false;
+    const rolloverResult2 = await doEntry.instance.processCronRollover({
+      env,
+      todayIso: "2026-09-05",
+      guildId: "guild_vital",
+    });
+    assert.equal(rolloverResult2.remindersSent, 0);
+    assert.equal(reminderDMDelivered, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 
 
 

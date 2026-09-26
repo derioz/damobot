@@ -398,3 +398,241 @@ export async function logLoaWarning({
 
   await sendLoaLogMessage({ env, embed, customFetch });
 }
+
+/**
+ * Log when an active or upcoming LOA is extended.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} options.displayName
+ * @param {string} options.oldEndDate
+ * @param {string} options.newEndDate
+ * @param {string} [options.reason]
+ * @param {string} [options.modifiedBy]
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaExtended({
+  env,
+  guildId,
+  userId,
+  displayName,
+  oldEndDate,
+  newEndDate,
+  reason = "",
+  modifiedBy = null,
+  customFetch = fetch,
+}) {
+  const isSelf = !modifiedBy || modifiedBy === userId;
+  const modifierText = isSelf ? "Self-extended" : `Extended by <@${modifiedBy}>`;
+
+  const fields = [
+    {
+      name: "👤 Staff Member",
+      value: `<@${userId}> (${displayName || "Staff"})`,
+      inline: true,
+    },
+    {
+      name: "📅 Previous Return",
+      value: formatPrettyDate(oldEndDate),
+      inline: true,
+    },
+    {
+      name: "📅 New Expected Return",
+      value: formatPrettyDate(newEndDate),
+      inline: true,
+    },
+    {
+      name: "🛡️ Modified By",
+      value: modifierText,
+      inline: true,
+    },
+  ];
+
+  if (reason) {
+    fields.push({
+      name: "📝 Reason / Note",
+      value: `> ${reason}`,
+      inline: false,
+    });
+  }
+
+  const embed = {
+    title: "📅 Staff LOA Extended",
+    description: `Leave of Absence for <@${userId}> was extended to **${formatPrettyDate(newEndDate)}**.`,
+    color: VITAL_ORANGE,
+    fields,
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+
+/**
+ * Log when an LOA reason is updated.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} options.displayName
+ * @param {string} options.oldReason
+ * @param {string} options.newReason
+ * @param {string} [options.modifiedBy]
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaReasonEdited({
+  env,
+  guildId,
+  userId,
+  displayName,
+  oldReason,
+  newReason,
+  modifiedBy = null,
+  customFetch = fetch,
+}) {
+  const fields = [
+    {
+      name: "👤 Staff Member",
+      value: `<@${userId}> (${displayName || "Staff"})`,
+      inline: true,
+    },
+    {
+      name: "📝 Previous Reason",
+      value: oldReason ? `> ${oldReason}` : "*None*",
+      inline: false,
+    },
+    {
+      name: "✏️ Updated Reason",
+      value: newReason ? `> ${newReason}` : "*None*",
+      inline: false,
+    },
+  ];
+
+  if (modifiedBy && modifiedBy !== userId) {
+    fields.push({
+      name: "🛡️ Changed By",
+      value: `<@${modifiedBy}>`,
+      inline: true,
+    });
+  }
+
+  const embed = {
+    title: "✏️ Staff LOA Reason Updated",
+    description: `The Leave of Absence reason for <@${userId}> has been updated.`,
+    color: VITAL_ORANGE,
+    fields,
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+
+/**
+ * Log when a 24-hour return reminder is successfully dispatched.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} options.displayName
+ * @param {string} options.endDate
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaReminderSent({
+  env,
+  guildId,
+  userId,
+  displayName,
+  endDate,
+  customFetch = fetch,
+}) {
+  const embed = {
+    title: "🔔 24-Hour LOA Return Reminder Sent",
+    description: `A direct message reminder was dispatched to <@${userId}> (${displayName || "Staff"}). Scheduled return: **${formatPrettyDate(endDate)}**.`,
+    color: 3447003, // Blue (#3498DB)
+    fields: [
+      {
+        name: "👤 Staff Member",
+        value: `<@${userId}>`,
+        inline: true,
+      },
+      {
+        name: "📅 Expected Return",
+        value: formatPrettyDate(endDate),
+        inline: true,
+      },
+    ],
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+
+/**
+ * Log when a 24-hour return reminder DM could not be delivered.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} options.displayName
+ * @param {string} options.endDate
+ * @param {string} [options.error]
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaReminderFailed({
+  env,
+  guildId,
+  userId,
+  displayName,
+  endDate,
+  error = "Direct messages disabled or blocked",
+  customFetch = fetch,
+}) {
+  const embed = {
+    title: "⚠️ LOA Reminder DM Delivery Failed",
+    description: `Could not deliver 24-hour return reminder DM to <@${userId}> (${displayName || "Staff"}).`,
+    color: 15105570, // Orange-Yellow (#E67E22)
+    fields: [
+      {
+        name: "👤 Staff Member",
+        value: `<@${userId}>`,
+        inline: true,
+      },
+      {
+        name: "📅 Expected Return",
+        value: formatPrettyDate(endDate),
+        inline: true,
+      },
+      {
+        name: "ℹ️ Reason",
+        value: error.includes("50007") || error.toLowerCase().includes("cannot send")
+          ? "User has Direct Messages disabled from server members or has blocked the bot."
+          : `API Error: ${error}`,
+        inline: false,
+      },
+    ],
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+
