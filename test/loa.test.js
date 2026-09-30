@@ -164,6 +164,7 @@ function createMockLoaDO(env = {}) {
     records: new Map(),
     metadata: new Map(),
     subscriptions: new Map(),
+    snapshots: new Map(),
     getQueryCount: () => executedQueryCount,
     sql: {
       exec(query, ...params) {
@@ -189,6 +190,65 @@ function createMockLoaDO(env = {}) {
         if (normalized.includes("INSERT INTO loa_metadata")) {
           const [key, val] = params;
           mockStorage.metadata.set(key, val);
+          return [];
+        }
+
+        // loa_role_snapshots queries
+        if (
+          normalized.includes("INSERT OR REPLACE INTO loa_role_snapshots") ||
+          normalized.includes("INSERT INTO loa_role_snapshots")
+        ) {
+          const [id, user_id, loa_id, role_ids, role_names, created_at, created_by, status] = params;
+          mockStorage.snapshots.set(id, {
+            id,
+            user_id,
+            loa_id,
+            role_ids,
+            role_names,
+            created_at,
+            created_by,
+            status,
+            restored_at: null,
+            restored_by: null,
+            restore_reason: null,
+          });
+          return [];
+        }
+
+        if (normalized.includes("SELECT * FROM loa_role_snapshots WHERE user_id = ? AND loa_id = ?")) {
+          const [userId, loaId] = params;
+          const matches = Array.from(mockStorage.snapshots.values()).filter(
+            (s) => s.user_id === userId && s.loa_id === loaId
+          );
+          matches.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+          return matches.slice(0, 1);
+        }
+
+        if (normalized.includes("SELECT * FROM loa_role_snapshots WHERE user_id = ? ORDER BY created_at DESC")) {
+          const userId = params[0];
+          const limit = params[1] || 1;
+          const matches = Array.from(mockStorage.snapshots.values()).filter(
+            (s) => s.user_id === userId
+          );
+          matches.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+          return matches.slice(0, limit);
+        }
+
+        if (normalized.includes("SELECT * FROM loa_role_snapshots WHERE id = ?")) {
+          const [id] = params;
+          const snap = mockStorage.snapshots.get(id);
+          return snap ? [{ ...snap }] : [];
+        }
+
+        if (normalized.includes("UPDATE loa_role_snapshots")) {
+          const [status, restored_at, restored_by, restore_reason, id] = params;
+          const snap = mockStorage.snapshots.get(id);
+          if (snap) {
+            snap.status = status;
+            snap.restored_at = restored_at;
+            snap.restored_by = restored_by;
+            snap.restore_reason = restore_reason;
+          }
           return [];
         }
 
@@ -680,6 +740,7 @@ function createMockEnvironment(
     DISCORD_BOT_TOKEN: botToken,
     STAFF_TEAM_ROLE_ID: staffRoleId,
     LOA_CHANNEL_ID: loaChannelId,
+    TODAY_ISO: "2026-09-02",
     STAFF_LOA: {
       idFromName: (guildId) => guildId || "default",
       get: (guildId) => {
@@ -3247,16 +3308,24 @@ test("VERSION BUMP: bumpVersionString correctly increments patch, minor, and maj
   assert.equal(bumpVersionString("v0.8.0", "v0.9.0"), "v0.9.0");
 });
 
-test("COMMAND REGISTRATION SCHEMA: /loa ONLY exposes list subcommand", () => {
+test("COMMAND REGISTRATION SCHEMA: /loa exposes list and restore subcommands", () => {
   const loaCmd = commands.find((c) => c.name === "loa");
   assert.ok(loaCmd, "/loa command definition must exist in registration commands array");
   assert.equal(loaCmd.description, "Manage Staff Leave of Absence (LOA)");
-  assert.equal(loaCmd.options?.length, 1, "/loa must only have 1 subcommand (list)");
+  assert.equal(loaCmd.options?.length, 2, "/loa exposes list and restore subcommands");
 
-  const listSub = loaCmd.options[0];
-  assert.equal(listSub.name, "list");
+  const listSub = loaCmd.options.find((o) => o.name === "list");
+  assert.ok(listSub, "list subcommand must exist");
   assert.equal(listSub.description, "Open or refresh the Staff LOA Center.");
   assert.equal(listSub.type, 1); // SUB_COMMAND
+
+  const restoreSub = loaCmd.options.find((o) => o.name === "restore");
+  assert.ok(restoreSub, "restore subcommand must exist");
+  assert.equal(restoreSub.description, "Admin recovery to restore a staff member's pre-LOA roles.");
+  assert.equal(restoreSub.type, 1); // SUB_COMMAND
+  assert.equal(restoreSub.options?.[0]?.name, "user");
+  assert.equal(restoreSub.options?.[0]?.type, 6); // USER
+  assert.equal(restoreSub.options?.[0]?.required, true);
 
   // Obsolete subcommands must NOT be registered
   const optionNames = loaCmd.options.map((o) => o.name);
@@ -6453,6 +6522,867 @@ test("ENHANCED LOA: 24-Hour Return Reminder dispatches DM and sets reminder_sent
     globalThis.fetch = originalFetch;
   }
 });
+
+// ============================================================================
+// PROBLEM 1: INVALID / PAST LOA DATES & TRANSACTIONAL ROLLBACK PROTECTION
+// ============================================================================
+
+test("VALIDATION: Submitting start modal with start date before current date is rejected without role changes or LOA creation", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29"; // Today is Sep 29, 2026
+
+  let roleModified = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const urlStr = String(url);
+    if (urlStr.includes("/members/") && (options.method === "PATCH" || options.method === "PUT")) {
+      roleModified = true;
+    }
+    return originalFetch(url, options);
+  };
+
+  try {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const body = JSON.stringify({
+      type: InteractionType.MODAL_SUBMIT,
+      guild_id: "guild_vital",
+      channel_id: TEST_LOA_CHANNEL_ID,
+      member: {
+        nick: "PastDateStaff",
+        user: { id: "staff_past_1", username: "paststaff" },
+        roles: [TEST_STAFF_ROLE_ID],
+      },
+      data: {
+        custom_id: LoaCustomId.MODAL_START,
+        components: [
+          { type: 1, components: [{ custom_id: "start_date", value: "09/20/2026" }] }, // Past date!
+          { type: 1, components: [{ custom_id: "end_date", value: "10/05/2026" }] },
+          { type: 1, components: [{ custom_id: "reason", value: "Time travel vacation" }] },
+        ],
+      },
+    });
+    const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+    const req = new Request("https://damo-bot.local/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-signature-ed25519": sig,
+        "x-signature-timestamp": timestamp,
+      },
+      body,
+    });
+
+    const res = await worker.fetch(req, env, {});
+    assert.equal(res.status, 200);
+    const json = await res.json();
+
+    // Must return clear ephemeral error
+    assert.equal(json.data.flags, EPHEMERAL_FLAG);
+    assert.ok(json.data.content.includes("LOA start date cannot be before the current date"));
+
+    // Role changes must NOT have occurred
+    assert.equal(roleModified, false);
+
+    // No LOA records must have been created in DO
+    assert.equal(doEntry.mockStorage.records.size, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("VALIDATION: Submitting start modal with return date earlier than start date is rejected", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    type: InteractionType.MODAL_SUBMIT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "InvertedDateStaff",
+      user: { id: "staff_inv_1", username: "invstaff" },
+      roles: [TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.MODAL_START,
+      components: [
+        { type: 1, components: [{ custom_id: "start_date", value: "10/10/2026" }] },
+        { type: 1, components: [{ custom_id: "end_date", value: "10/05/2026" }] }, // earlier than start date!
+        { type: 1, components: [{ custom_id: "reason", value: "Inverted dates" }] },
+      ],
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  assert.equal(json.data.flags, EPHEMERAL_FLAG);
+  assert.ok(json.data.content.includes("End date cannot be before start date"));
+  assert.equal(doEntry.mockStorage.records.size, 0);
+});
+
+test("VALIDATION: Attempting to create duplicate active LOA for same user is rejected", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  // Existing active LOA
+  doEntry.instance.createLoa({
+    id: "loa_active_dup",
+    guildId: "guild_vital",
+    userId: "staff_dup_1",
+    displayName: "DupStaff",
+    startDate: "2026-09-29",
+    endDate: "2026-10-10",
+    reason: "Current active LOA",
+    todayIso: "2026-09-29",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    type: InteractionType.MODAL_SUBMIT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "DupStaff",
+      user: { id: "staff_dup_1", username: "dupstaff" },
+      roles: [TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.MODAL_START,
+      components: [
+        { type: 1, components: [{ custom_id: "start_date", value: "09/30/2026" }] },
+        { type: 1, components: [{ custom_id: "end_date", value: "10/15/2026" }] },
+        { type: 1, components: [{ custom_id: "reason", value: "Second LOA attempt" }] },
+      ],
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  assert.equal(json.data.flags, EPHEMERAL_FLAG);
+  assert.ok(json.data.content.includes("You already have an active or upcoming LOA"));
+});
+
+test("TRANSACTIONAL ROLLBACK: If Discord role swap fails after DO storage, original roles are restored and failure logged", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const urlStr = String(url);
+    // Simulate Discord REST error on role swap (500 internal server error)
+    if (urlStr.includes("/members/staff_rollback_1") && options.method === "PATCH") {
+      return new Response(JSON.stringify({ message: "Discord API Failure" }), { status: 500 });
+    }
+    return originalFetch(url, options);
+  };
+
+  try {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const body = JSON.stringify({
+      type: InteractionType.MODAL_SUBMIT,
+      guild_id: "guild_vital",
+      channel_id: TEST_LOA_CHANNEL_ID,
+      member: {
+        nick: "RollbackStaff",
+        user: { id: "staff_rollback_1", username: "rollbackstaff" },
+        roles: [TEST_STAFF_ROLE_ID, "1241050651677556806"],
+      },
+      data: {
+        custom_id: LoaCustomId.MODAL_START,
+        components: [
+          { type: 1, components: [{ custom_id: "start_date", value: "09/29/2026" }] },
+          { type: 1, components: [{ custom_id: "end_date", value: "10/10/2026" }] },
+          { type: 1, components: [{ custom_id: "reason", value: "Testing transactional rollback" }] },
+        ],
+      },
+    });
+    const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+    const req = new Request("https://damo-bot.local/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-signature-ed25519": sig,
+        "x-signature-timestamp": timestamp,
+      },
+      body,
+    });
+
+    const res = await worker.fetch(req, env, {});
+    assert.equal(res.status, 200);
+    const json = await res.json();
+
+    // Must inform user of failure and rollback
+    assert.equal(json.data.flags, EPHEMERAL_FLAG);
+    assert.ok(json.data.content.includes("Leave of Absence could not be started"));
+    assert.ok(json.data.content.includes("automatically restored and the LOA was rolled back"));
+
+    // Verify DO records marked failed or rolled back
+    const snapshots = Array.from(doEntry.mockStorage.snapshots.values()).filter(
+      (s) => s.user_id === "staff_rollback_1"
+    );
+    assert.ok(snapshots.length > 0);
+    assert.equal(snapshots[0].status, "ROLLED_BACK");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ============================================================================
+// PROBLEM 2: SEPARATE LOA OWNERSHIP FROM STAFF PERMISSIONS (NO LOCKOUT)
+// ============================================================================
+
+test("OWNERSHIP ACCESS: Staff member with stripped staff roles can still view 'My LOA' and return early", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  // Create an active LOA where staff member has had staff roles removed
+  doEntry.instance.createLoa({
+    id: "loa_stripped_owner",
+    guildId: "guild_vital",
+    userId: "staff_stripped_1",
+    displayName: "StrippedStaff",
+    startDate: "2026-09-29",
+    endDate: "2026-10-10",
+    reason: "On LOA with staff roles removed",
+    todayIso: "2026-09-29",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // 1. User clicks "My LOA" button (BTN_STATUS) with ZERO staff roles (only regular member role)
+  const bodyStatus = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "LOA | StrippedStaff",
+      user: { id: "staff_stripped_1", username: "strippedstaff" },
+      roles: ["733384365513506856"], // Only Member role! No StaffTeam role!
+    },
+    data: {
+      custom_id: LoaCustomId.BTN_STATUS,
+      component_type: 2,
+    },
+  });
+  const sigStatus = await signDiscordPayload(bodyStatus, keyPair, timestamp);
+
+  const reqStatus = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sigStatus,
+      "x-signature-timestamp": timestamp,
+    },
+    body: bodyStatus,
+  });
+
+  const resStatus = await worker.fetch(reqStatus, env, {});
+  assert.equal(resStatus.status, 200);
+  const jsonStatus = await resStatus.json();
+
+  // Must allow access based on ownership!
+  assert.equal(jsonStatus.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const statusText = getContainerTexts(jsonStatus.data.components[0]);
+  assert.ok(statusText.includes("# 🏖️ My LOA"));
+  assert.ok(statusText.includes("On LOA with staff roles removed"));
+
+  // 2. User confirms early return via CONFIRM_RETURN_PREFIX
+  const bodyReturn = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "LOA | StrippedStaff",
+      user: { id: "staff_stripped_1", username: "strippedstaff" },
+      roles: ["733384365513506856"], // Zero staff roles!
+    },
+    data: {
+      custom_id: `${LoaCustomId.CONFIRM_RETURN_PREFIX}loa_stripped_owner`,
+      component_type: 2,
+    },
+  });
+  const sigReturn = await signDiscordPayload(bodyReturn, keyPair, timestamp);
+
+  const reqReturn = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sigReturn,
+      "x-signature-timestamp": timestamp,
+    },
+    body: bodyReturn,
+  });
+
+  const resReturn = await worker.fetch(reqReturn, env, {});
+  assert.equal(resReturn.status, 200);
+  const jsonReturn = await resReturn.json();
+
+  assert.equal(jsonReturn.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const returnText = getContainerTexts(jsonReturn.data.components[0]);
+  assert.ok(returnText.includes("Welcome back!"));
+
+  const rec = doEntry.instance.getLoaById("loa_stripped_owner");
+  assert.equal(rec.ended_early, 1);
+});
+
+test("OWNERSHIP ACCESS: Non-owner without staff roles attempting to manage another user's LOA is rejected", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  // Create an active LOA owned by staff_user_a
+  doEntry.instance.createLoa({
+    id: "loa_user_a",
+    guildId: "guild_vital",
+    userId: "staff_user_a",
+    displayName: "UserA",
+    startDate: "2026-09-29",
+    endDate: "2026-10-10",
+    reason: "User A Vacation",
+    todayIso: "2026-09-29",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // User B (non-owner, no staff roles) tries to cancel/return User A's LOA
+  const body = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "IntruderUser",
+      user: { id: "user_b_non_owner", username: "userb" },
+      roles: ["733384365513506856"], // Only regular member role
+    },
+    data: {
+      custom_id: `${LoaCustomId.CONFIRM_RETURN_PREFIX}loa_user_a`,
+      component_type: 2,
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  // Must reject unauthorized management of someone else's LOA
+  assert.equal(json.data.flags, EPHEMERAL_FLAG);
+  assert.ok(
+    json.data.content.includes("This command is only available to Vital RP staff") ||
+    json.data.content.includes("You can only manage your own Leave of Absence")
+  );
+
+  // Verify LOA was NOT closed
+  const rec = doEntry.instance.getLoaById("loa_user_a");
+  assert.equal(rec.ended_early, 0);
+});
+
+// ============================================================================
+// PROBLEM 3: ADMIN ROLE RECOVERY SYSTEM & SNAPSHOT SAFETY
+// ============================================================================
+
+test("ADMIN RECOVERY UI: Active LOA dashboard displays 'Restore Staff Roles' button for managers with NO delete button", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // Admin user clicks "View Active LOAs" (BTN_ACTIVE)
+  const body = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "HeadAdmin",
+      user: { id: "admin_1", username: "admin1" },
+      roles: [DEFAULT_HEAD_ADMIN_ROLE_ID, TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.BTN_ACTIVE,
+      component_type: 2,
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  assert.equal(json.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const container = json.data.components[0];
+  const containerStr = JSON.stringify(container);
+
+  // Must have "Restore Staff Roles" button for manager
+  assert.ok(containerStr.includes(LoaCustomId.BTN_RESTORE_ROLES));
+  assert.ok(containerStr.includes("Restore Staff Roles"));
+
+  // Global UI Rule: Strictly NO ❌ / X delete or dismiss button!
+  assert.ok(!containerStr.includes("❌"));
+  assert.ok(!containerStr.includes("cancel_dismiss"));
+  assert.ok(!containerStr.includes("Delete"));
+});
+
+test("ADMIN RECOVERY WORKFLOW: Selecting user presents recovery confirmation and confirming restores roles", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  // Pre-seed an active LOA and saved role snapshot for victim user
+  doEntry.instance.createLoa({
+    id: "loa_victim_1",
+    guildId: "guild_vital",
+    userId: "victim_user_1",
+    displayName: "VictimStaff",
+    startDate: "2026-09-29",
+    endDate: "2026-10-10",
+    reason: "Roles stripped by bug",
+    todayIso: "2026-09-29",
+  });
+
+  doEntry.instance.saveRoleSnapshot({
+    id: "snap_victim_1",
+    userId: "victim_user_1",
+    loaId: "loa_victim_1",
+    roleIds: [TEST_STAFF_ROLE_ID, "1241050651677556806"],
+    roleNames: {
+      [TEST_STAFF_ROLE_ID]: "StaffTeam",
+      "1241050651677556806": "Whitelist Approved",
+    },
+    createdBy: "victim_user_1",
+    createdAt: "2026-09-29T12:00:00.000Z",
+    status: "ACTIVE",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // 1. Admin clicks "Restore Staff Roles" button -> renders User Select prompt
+  const bodyBtn = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "HeadAdmin",
+      user: { id: "admin_1", username: "admin1" },
+      roles: [DEFAULT_HEAD_ADMIN_ROLE_ID, TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.BTN_RESTORE_ROLES,
+      component_type: 2,
+    },
+  });
+  const sigBtn = await signDiscordPayload(bodyBtn, keyPair, timestamp);
+
+  const reqBtn = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sigBtn,
+      "x-signature-timestamp": timestamp,
+    },
+    body: bodyBtn,
+  });
+
+  const resBtn = await worker.fetch(reqBtn, env, {});
+  assert.equal(resBtn.status, 200);
+  const jsonBtn = await resBtn.json();
+
+  assert.equal(jsonBtn.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const promptText = getContainerTexts(jsonBtn.data.components[0]);
+  assert.ok(promptText.includes("Restore Staff Roles"));
+  assert.ok(promptText.includes("Select a staff member below"));
+
+  // 2. Admin selects victim_user_1 via SELECT_RESTORE_USER
+  const bodySelect = JSON.stringify({
+    type: InteractionType.MESSAGE_COMPONENT,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "HeadAdmin",
+      user: { id: "admin_1", username: "admin1" },
+      roles: [DEFAULT_HEAD_ADMIN_ROLE_ID, TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      custom_id: LoaCustomId.SELECT_RESTORE_USER,
+      component_type: 5,
+      values: ["victim_user_1"],
+    },
+  });
+  const sigSelect = await signDiscordPayload(bodySelect, keyPair, timestamp);
+
+  const reqSelect = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sigSelect,
+      "x-signature-timestamp": timestamp,
+    },
+    body: bodySelect,
+  });
+
+  const resSelect = await worker.fetch(reqSelect, env, {});
+  assert.equal(resSelect.status, 200);
+  const jsonSelect = await resSelect.json();
+
+  assert.equal(jsonSelect.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const confirmPreviewText = getContainerTexts(jsonSelect.data.components[0]);
+  assert.ok(confirmPreviewText.includes("LOA Role Recovery"));
+  assert.ok(confirmPreviewText.includes("<@victim_user_1>"));
+  assert.ok(confirmPreviewText.includes("snap_victim_1"));
+  assert.ok(confirmPreviewText.includes("StaffTeam"));
+
+  // 3. Admin clicks "Confirm Restore" button
+  let restoredRolesCall = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const urlStr = String(url);
+    if (urlStr.includes("/members/victim_user_1") && options.method === "PATCH") {
+      restoredRolesCall = true;
+      return new Response(JSON.stringify({ roles: [TEST_STAFF_ROLE_ID, "1241050651677556806"] }), {
+        status: 200,
+      });
+    }
+    return originalFetch(url, options);
+  };
+
+  try {
+    const bodyConfirm = JSON.stringify({
+      type: InteractionType.MESSAGE_COMPONENT,
+      guild_id: "guild_vital",
+      channel_id: TEST_LOA_CHANNEL_ID,
+      member: {
+        nick: "HeadAdmin",
+        user: { id: "admin_1", username: "admin1" },
+        roles: [DEFAULT_HEAD_ADMIN_ROLE_ID, TEST_STAFF_ROLE_ID],
+      },
+      data: {
+        custom_id: `${LoaCustomId.CONFIRM_RESTORE_PREFIX}victim_user_1`,
+        component_type: 2,
+      },
+    });
+    const sigConfirm = await signDiscordPayload(bodyConfirm, keyPair, timestamp);
+
+    const reqConfirm = new Request("https://damo-bot.local/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-signature-ed25519": sigConfirm,
+        "x-signature-timestamp": timestamp,
+      },
+      body: bodyConfirm,
+    });
+
+    const resConfirm = await worker.fetch(reqConfirm, env, {});
+    assert.equal(resConfirm.status, 200);
+    const jsonConfirm = await resConfirm.json();
+
+    assert.equal(jsonConfirm.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+    const resultText = getContainerTexts(jsonConfirm.data.components[0]);
+    assert.ok(resultText.includes("# ✅ Staff Roles Restored"));
+    assert.ok(resultText.includes("Successfully recovered"));
+
+    // Verify Discord member patch was executed
+    assert.equal(restoredRolesCall, true);
+
+    // Verify snapshot status was updated to RECOVERY_USED
+    const snap = doEntry.mockStorage.snapshots.get("snap_victim_1");
+    assert.equal(snap.status, "RECOVERY_USED");
+    assert.equal(snap.restored_by, "admin_1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("EMERGENCY COMMAND: /loa restore user:@User allows authorized admin from any channel", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  // Pre-seed snapshot for target user
+  doEntry.instance.saveRoleSnapshot({
+    id: "snap_emergency_1",
+    userId: "staff_emergency_target",
+    loaId: "loa_emergency_target",
+    roleIds: [TEST_STAFF_ROLE_ID],
+    roleNames: { [TEST_STAFF_ROLE_ID]: "StaffTeam" },
+    createdBy: "staff_emergency_target",
+    createdAt: "2026-09-29T12:00:00.000Z",
+    status: "ACTIVE",
+  });
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // Admin invokes `/loa restore user:staff_emergency_target` in OTHER_CHANNEL_ID (not LOA center!)
+  const body = JSON.stringify({
+    type: InteractionType.APPLICATION_COMMAND,
+    guild_id: "guild_vital",
+    channel_id: OTHER_CHANNEL_ID, // Emergency restore permitted in any channel!
+    member: {
+      nick: "HeadAdmin",
+      user: { id: "admin_1", username: "admin1" },
+      roles: [DEFAULT_HEAD_ADMIN_ROLE_ID, TEST_STAFF_ROLE_ID],
+    },
+    data: {
+      name: "loa",
+      options: [
+        {
+          name: "restore",
+          type: 1,
+          options: [
+            {
+              name: "user",
+              type: 6,
+              value: "staff_emergency_target",
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  assert.equal(json.data.flags, EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG);
+  const previewText = getContainerTexts(json.data.components[0]);
+  assert.ok(previewText.includes("LOA Role Recovery"));
+  assert.ok(previewText.includes("<@staff_emergency_target>"));
+  assert.ok(previewText.includes("StaffTeam"));
+});
+
+test("EMERGENCY COMMAND: /loa restore is strictly rejected for regular non-admin staff", async () => {
+  const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawPub = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+  const pubHex = Buffer.from(rawPub).toString("hex");
+
+  const guildMap = new Map();
+  const doEntry = createMockLoaDO();
+  guildMap.set("guild_vital", doEntry);
+  const env = createMockEnvironment(pubHex, guildMap);
+  env.TODAY_ISO = "2026-09-29";
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // Regular staff member (not admin / manager) tries to run /loa restore
+  const body = JSON.stringify({
+    type: InteractionType.APPLICATION_COMMAND,
+    guild_id: "guild_vital",
+    channel_id: TEST_LOA_CHANNEL_ID,
+    member: {
+      nick: "RegularStaff",
+      user: { id: "regular_staff_1", username: "regularstaff" },
+      roles: [TEST_STAFF_ROLE_ID], // Regular staff, NOT an admin or manager
+    },
+    data: {
+      name: "loa",
+      options: [
+        {
+          name: "restore",
+          type: 1,
+          options: [
+            {
+              name: "user",
+              type: 6,
+              value: "some_other_user",
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const sig = await signDiscordPayload(body, keyPair, timestamp);
+
+  const req = new Request("https://damo-bot.local/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": sig,
+      "x-signature-timestamp": timestamp,
+    },
+    body,
+  });
+
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 200);
+  const json = await res.json();
+
+  assert.equal(json.data.flags, EPHEMERAL_FLAG);
+  assert.ok(json.data.content.includes("You do not have permission to restore staff roles"));
+});
+
+test("SNAPSHOT SAFETY: Pre-LOA role snapshot is never overwritten by subsequent reduced role set, and snapshot history is preserved", async () => {
+  const doEntry = createMockLoaDO();
+
+  // 1. Initial pre-LOA snapshot with full staff roles
+  const snap1 = doEntry.instance.saveRoleSnapshot({
+    id: "snap_safe_1",
+    userId: "staff_safe_user",
+    loaId: "loa_safe_1",
+    roleIds: [TEST_STAFF_ROLE_ID, "1241050651677556806"],
+    roleNames: {
+      [TEST_STAFF_ROLE_ID]: "StaffTeam",
+      "1241050651677556806": "Whitelist Approved",
+    },
+    createdBy: "staff_safe_user",
+    createdAt: "2026-09-29T10:00:00.000Z",
+    status: "ACTIVE",
+  });
+  assert.equal(snap1.success, true);
+
+  // 2. Later, a bug or empty role list attempts to overwrite the existing active snapshot
+  const snap2 = doEntry.instance.saveRoleSnapshot({
+    id: "snap_safe_1",
+    userId: "staff_safe_user",
+    loaId: "loa_safe_1",
+    roleIds: [], // Empty role set after roles were removed!
+    roleNames: {},
+    createdBy: "staff_safe_user",
+    createdAt: "2026-09-29T11:00:00.000Z",
+    status: "ACTIVE",
+  });
+
+  // Verify anti-overwrite safety: original restore point remains intact!
+  assert.equal(snap2.overwritten, false);
+  const latestSnap = doEntry.instance.getLatestSnapshotForUser("staff_safe_user", "loa_safe_1");
+  assert.equal(latestSnap.roleIds.length, 2);
+  assert.ok(latestSnap.roleIds.includes(TEST_STAFF_ROLE_ID));
+
+  // 3. Verify snapshot history: multiple distinct snapshots are kept
+  doEntry.instance.saveRoleSnapshot({
+    id: "snap_safe_2",
+    userId: "staff_safe_user",
+    loaId: "loa_safe_2",
+    roleIds: [TEST_STAFF_ROLE_ID, "735479005561618452"],
+    roleNames: { [TEST_STAFF_ROLE_ID]: "StaffTeam", "735479005561618452": "Gif" },
+    createdBy: "staff_safe_user",
+    createdAt: "2026-09-29T12:00:00.000Z",
+    status: "COMPLETED",
+  });
+
+  const history = doEntry.instance.getSnapshotHistoryForUser("staff_safe_user", 5);
+  assert.ok(history.length >= 2);
+});
+
 
 
 

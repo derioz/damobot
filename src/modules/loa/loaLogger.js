@@ -636,3 +636,193 @@ export async function logLoaReminderFailed({
   await sendLoaLogMessage({ env, embed, customFetch });
 }
 
+/**
+ * Log when an authorized administrator manually recovers and restores a staff member's pre-LOA roles.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} [options.loaId]
+ * @param {string} [options.snapshotId]
+ * @param {Array<string>} [options.restoredRoleIds]
+ * @param {Array<Object>} [options.skippedRoles] - Array of { roleId, roleName, reason }
+ * @param {boolean} [options.loaRoleRemoved=true]
+ * @param {string} [options.recoveryType="Manual Admin Recovery"]
+ * @param {string} options.restoredBy - Admin Discord ID
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaRecovery({
+  env,
+  guildId,
+  userId,
+  loaId = null,
+  snapshotId = null,
+  restoredRoleIds = [],
+  skippedRoles = [],
+  loaRoleRemoved = true,
+  recoveryType = "Manual Admin Recovery",
+  restoredBy,
+  customFetch = fetch,
+}) {
+  const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+  const roleMap = rolesRes.success && rolesRes.roleMap ? rolesRes.roleMap : new Map();
+
+  const restoredLines =
+    restoredRoleIds.length > 0
+      ? restoredRoleIds
+          .map((id) => {
+            const role = roleMap.get(id);
+            return role ? `• ${role.name}` : `• <@&${id}>`;
+          })
+          .join("\n")
+      : "• None";
+
+  const skippedLines =
+    skippedRoles.length > 0
+      ? skippedRoles
+          .map((item) => {
+            const name = item.roleName || (roleMap.get(item.roleId)?.name) || item.roleId;
+            return `• ${name}\n  Reason: ${item.reason || "Unmanageable"}`;
+          })
+          .join("\n")
+      : "• None";
+
+  const fields = [
+    {
+      name: "👤 Staff Member",
+      value: `<@${userId}>\nDiscord ID: \`${userId}\``,
+      inline: true,
+    },
+    {
+      name: "🛡️ Restored By",
+      value: restoredBy ? `<@${restoredBy}>` : "*Admin*",
+      inline: true,
+    },
+    {
+      name: "📋 Reference IDs",
+      value: `LOA ID: \`${loaId || "None"}\`\nSnapshot ID: \`${snapshotId || "None"}\``,
+      inline: false,
+    },
+    {
+      name: "✅ Roles Restored",
+      value: restoredLines,
+      inline: false,
+    },
+  ];
+
+  if (skippedRoles.length > 0) {
+    fields.push({
+      name: "⚠️ Roles Skipped",
+      value: skippedLines,
+      inline: false,
+    });
+  }
+
+  fields.push(
+    {
+      name: "🏷️ LOA Role Removed",
+      value: loaRoleRemoved ? "Yes" : "No",
+      inline: true,
+    },
+    {
+      name: "⚙️ Recovery Type",
+      value: recoveryType,
+      inline: true,
+    }
+  );
+
+  const embed = {
+    title: "🛠️ LOA ROLE RECOVERY",
+    description: `Staff roles have been recovered and restored for <@${userId}>.`,
+    color: VITAL_ORANGE,
+    fields,
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+
+/**
+ * Log when an LOA creation fails after role swap begins and automatic rollback restores roles.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {string} [options.displayName]
+ * @param {string} [options.loaId]
+ * @param {string} [options.snapshotId]
+ * @param {string} [options.originalError]
+ * @param {Array<string>} [options.restoredRoleIds]
+ * @param {Function} [options.customFetch=fetch]
+ */
+export async function logLoaRollback({
+  env,
+  guildId,
+  userId,
+  displayName,
+  loaId = null,
+  snapshotId = null,
+  originalError = "Unknown error",
+  restoredRoleIds = [],
+  customFetch = fetch,
+}) {
+  const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+  const roleMap = rolesRes.success && rolesRes.roleMap ? rolesRes.roleMap : new Map();
+
+  const restoredLines =
+    restoredRoleIds.length > 0
+      ? restoredRoleIds
+          .map((id) => {
+            const role = roleMap.get(id);
+            return role ? `• ${role.name}` : `• <@&${id}>`;
+          })
+          .join("\n")
+      : "• All original roles preserved";
+
+  const embed = {
+    title: "⚠️ LOA Start Failed - Automatic Rollback",
+    description: `An error occurred while starting LOA for <@${userId}> (${displayName || "Staff"}). The automatic rollback restored their original pre-LOA roles.`,
+    color: 15158332, // Red (#E74C3C)
+    fields: [
+      {
+        name: "👤 Staff Member",
+        value: `<@${userId}>\nDiscord ID: \`${userId}\``,
+        inline: true,
+      },
+      {
+        name: "⚙️ Operation",
+        value: "Automatic Rollback",
+        inline: true,
+      },
+      {
+        name: "📋 Reference IDs",
+        value: `LOA ID: \`${loaId || "None"}\`\nSnapshot ID: \`${snapshotId || "None"}\``,
+        inline: false,
+      },
+      {
+        name: "❌ Original Error",
+        value: `\`\`\`\n${String(originalError).slice(0, 1000)}\n\`\`\``,
+        inline: false,
+      },
+      {
+        name: "🔄 Rollback Action",
+        value: `Original staff roles restored, LOA role removed, and LOA marked failed.\n${restoredLines}`,
+        inline: false,
+      },
+    ],
+    thumbnail: { url: VITAL_RP_LOGO_URL },
+    footer: {
+      text: `Damo Bot • Staff LOA Manager • ${DAMO_BOT_VERSION}`,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sendLoaLogMessage({ env, embed, customFetch });
+}
+

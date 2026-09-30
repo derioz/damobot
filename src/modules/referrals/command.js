@@ -6,9 +6,67 @@ import {
   ephemeralTextResponse,
   getUserFromInteraction,
   getCommandOption,
+  sendDiscordChannelMessage,
+  IS_COMPONENTS_V2_FLAG,
 } from "../../shared/discord.js";
+import {
+  createContainer,
+  createTextDisplay,
+  createSeparator,
+  buildDamoFooter,
+} from "../../shared/components.js";
 import { submitReferralToSheet } from "./sheets.js";
 import { referralConfig, isReferralChannel } from "../../config.js";
+
+/**
+ * Build and send a Components V2 confirmation message to the channel
+ * after a referral has been successfully saved.
+ *
+ * Failures here must never affect the already-saved referral.
+ *
+ * @param {Object} options
+ * @param {string} options.channelId
+ * @param {string} options.referredUserId
+ * @param {string} options.referrerId
+ * @param {Object} options.env
+ */
+async function sendReferralConfirmation({ channelId, referredUserId, referrerId, env }) {
+  try {
+    if (!channelId) {
+      console.warn("Referral confirmation skipped: no channelId available");
+      return;
+    }
+
+    const timestamp = `<t:${Math.floor(Date.now() / 1000)}:f>`;
+
+    const container = createContainer([
+      createTextDisplay("### ✅ Referral Logged"),
+      createSeparator(),
+      createTextDisplay(
+        `**Referred:** <@${referredUserId}>\n**Referred By:** <@${referrerId}>\n**Logged:** ${timestamp}`
+      ),
+      createSeparator(),
+      createTextDisplay("-# This referral has been successfully logged."),
+      createSeparator(1, false),
+      buildDamoFooter(),
+    ]);
+
+    const res = await sendDiscordChannelMessage({
+      channelId,
+      env,
+      components: [container],
+      flags: IS_COMPONENTS_V2_FLAG,
+      allowed_mentions: { parse: [] },
+    });
+
+    if (res && !res.ok) {
+      const errText = await res.text().catch(() => "unknown");
+      console.error(`Referral confirmation message failed (${res.status}): ${errText}`);
+    }
+  } catch (err) {
+    console.error("Referral confirmation send error:", err?.message || err);
+  }
+}
 
 /**
  * Handle /referral slash command.
@@ -80,6 +138,18 @@ export async function handleReferralCommand(interaction, env, ctx) {
       );
     }
 
+    // Referral saved successfully — send confirmation as a background task
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(
+        sendReferralConfirmation({
+          channelId,
+          referredUserId: submittingUserId,
+          referrerId,
+          env,
+        })
+      );
+    }
+
     return ephemeralTextResponse(
       "✅ Referral Submitted\n\nYou and the person who referred you have been added to the referral list.\n\nOnce all referral requirements have been met, we'll reach out to you."
     );
@@ -92,3 +162,4 @@ export async function handleReferralCommand(interaction, env, ctx) {
     );
   }
 }
+

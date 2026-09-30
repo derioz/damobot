@@ -355,3 +355,115 @@ export function getLoaStatus(loa, todayIso = getTodayInChicago()) {
   return { code: "COMPLETED", label: "🔵 Completed" };
 }
 
+/**
+ * Validate start and end dates for LOA creation/editing before any Discord roles are changed.
+ *
+ * Requirements:
+ * - LOA start date cannot be before the current date.
+ * - LOA end/return date cannot be before the current date.
+ * - Return date cannot be earlier than the start date.
+ * - Reject invalid or malformed date values.
+ * - Reject missing required dates.
+ * - Enforce optional minimum/maximum duration bounds.
+ *
+ * @param {Object} params
+ * @param {string} params.startDateStr - Raw start date string
+ * @param {string} params.endDateStr - Raw end/return date string
+ * @param {string} [params.todayIso] - Current date in America/Chicago (YYYY-MM-DD)
+ * @param {number} [params.minDays] - Minimum duration in days
+ * @param {number} [params.maxDays] - Maximum duration in days
+ * @returns {{
+ *   valid: boolean,
+ *   error?: string,
+ *   startDateIso?: string,
+ *   endDateIso?: string,
+ *   startDisplayDate?: string,
+ *   endDisplayDate?: string,
+ *   durationDays?: number
+ * }}
+ */
+export function validateLoaDates({
+  startDateStr,
+  endDateStr,
+  todayIso = getTodayInChicago(),
+  minDays = null,
+  maxDays = null,
+} = {}) {
+  if (!startDateStr || typeof startDateStr !== "string" || !startDateStr.trim()) {
+    return { valid: false, error: "Start date is required." };
+  }
+  if (!endDateStr || typeof endDateStr !== "string" || !endDateStr.trim()) {
+    return { valid: false, error: "End date is required." };
+  }
+
+  const parsedStart = parseAndValidateDate(startDateStr, todayIso);
+  if (!parsedStart.valid) {
+    return {
+      valid: false,
+      error: `Invalid Start Date\n\n${parsedStart.error || "Please enter a valid date, for example: `9/5/2026`, `09/05/2026`, or `9/5`"}`,
+    };
+  }
+
+  const parsedEnd = parseAndValidateDate(endDateStr, todayIso);
+  if (!parsedEnd.valid) {
+    return {
+      valid: false,
+      error: `Invalid End Date\n\n${parsedEnd.error || "Please enter a valid date, for example: `9/12/2026`, `09/12/2026`, or `9/12`"}`,
+    };
+  }
+
+  // 1. LOA start date cannot be before the current date
+  if (parsedStart.isoDate < todayIso) {
+    return {
+      valid: false,
+      error: `LOA start date cannot be before the current date (${todayIso}).`,
+    };
+  }
+
+  // 2. LOA end/return date cannot be before the current date
+  if (parsedEnd.isoDate < todayIso) {
+    return {
+      valid: false,
+      error: `LOA return date cannot be before the current date (${todayIso}).`,
+    };
+  }
+
+  // 3. Return date cannot be earlier than the start date
+  if (parsedEnd.isoDate < parsedStart.isoDate) {
+    return {
+      valid: false,
+      error: "End date cannot be before start date.",
+    };
+  }
+
+  const startDateObj = new Date(`${parsedStart.isoDate}T00:00:00Z`);
+  const endDateObj = new Date(`${parsedEnd.isoDate}T00:00:00Z`);
+  const durationDays =
+    Math.round((endDateObj - startDateObj) / (1000 * 60 * 60 * 24)) + 1;
+
+  if (minDays && durationDays < minDays) {
+    return {
+      valid: false,
+      error: `LOA duration must be at least ${minDays} day${minDays === 1 ? "" : "s"}.`,
+    };
+  }
+
+  if (maxDays && durationDays > maxDays) {
+    return {
+      valid: false,
+      error: `LOA duration cannot exceed ${maxDays} days.`,
+    };
+  }
+
+  return {
+    valid: true,
+    startDate: parsedStart.isoDate,
+    endDate: parsedEnd.isoDate,
+    startDateIso: parsedStart.isoDate,
+    endDateIso: parsedEnd.isoDate,
+    startDisplayDate: parsedStart.displayDate,
+    endDisplayDate: parsedEnd.displayDate,
+    durationDays,
+  };
+}
+

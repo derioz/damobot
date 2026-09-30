@@ -164,6 +164,7 @@ export function normalizeLoaRecord(row) {
     reasonHistory,
     is_legacy_snapshot: isLegacy ? 1 : 0,
     isLegacySnapshot: Boolean(isLegacy),
+    ownerDiscordId: row.user_id || row.userId || row.ownerDiscordId || null,
   };
 }
 
@@ -180,6 +181,7 @@ export class StaffLoaDO {
     this.memoryLoas = new Map();
     this.memoryMeta = new Map();
     this.memorySubscriptions = new Map();
+    this.memorySnapshots = new Map();
 
     this.initDatabase();
   }
@@ -302,16 +304,38 @@ export class StaffLoaDO {
       this.ctx.storage.sql.exec(`
         CREATE INDEX IF NOT EXISTS idx_loa_subs_user ON loa_subscriptions (subscriber_user_id);
       `);
+
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS loa_role_snapshots (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          loa_id TEXT,
+          role_ids TEXT NOT NULL,
+          role_names TEXT,
+          created_at TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          restored_at TEXT,
+          restored_by TEXT,
+          restore_reason TEXT,
+          status TEXT NOT NULL DEFAULT 'ACTIVE'
+        );
+      `);
+      this.ctx.storage.sql.exec(`
+        CREATE INDEX IF NOT EXISTS idx_loa_snapshots_user ON loa_role_snapshots (user_id, created_at DESC);
+      `);
+      this.ctx.storage.sql.exec(`
+        CREATE INDEX IF NOT EXISTS idx_loa_snapshots_loa ON loa_role_snapshots (loa_id);
+      `);
     }
   }
 
   /**
-   * Find an active or upcoming LOA for a specific user.
-   * An LOA is active or upcoming if:
+   * Find an active, upcoming, or unended LOA for a specific user.
+   * An LOA is active, upcoming, or unended if:
    *  - cancelled = 0
    *  - ended_early = 0
    *  - ended_at IS NULL
-   *  - end_date >= todayIso
+   *  - end_date >= todayIso OR role_restore_status != 'completed'
    *
    * @param {string} userId
    * @param {string} todayIso (YYYY-MM-DD)
@@ -325,7 +349,7 @@ export class StaffLoaDO {
            AND cancelled = 0
            AND ended_early = 0
            AND ended_at IS NULL
-           AND end_date >= ?
+           AND (end_date >= ? OR role_restore_status != 'completed')
          ORDER BY start_date ASC
          LIMIT 1`,
         userId,
@@ -341,7 +365,7 @@ export class StaffLoaDO {
         record.cancelled === 0 &&
         record.ended_early === 0 &&
         !record.ended_at &&
-        record.end_date >= todayIso
+        (record.end_date >= todayIso || record.role_restore_status !== "completed")
       ) {
         return normalizeLoaRecord(record);
       }
@@ -767,6 +791,454 @@ export class StaffLoaDO {
     this.memoryLoas.set(loaId, updated);
 
     return { success: true, loa: normalizeLoaRecord(updated) };
+  }
+
+  /**
+   * Helper to normalize a raw loa_role_snapshots database row into an object.
+   * @param {Object} row
+   * @returns {Object|null}
+   */
+  _normalizeSnapshot(row) {
+    if (!row) return null;
+    let roleIds = [];
+    if (Array.isArray(row.roleIds)) {
+      roleIds = row.roleIds;
+    } else if (Array.isArray(row.role_ids)) {
+      roleIds = row.role_ids;
+    } else if (typeof row.role_ids === "string" && row.role_ids) {
+      try {
+        roleIds = JSON.parse(row.role_ids);
+      } catch (_) {
+        roleIds = [];
+      }
+    }
+
+    let roleNames = {};
+    if (row.roleNames && typeof row.roleNames === "object") {
+      roleNames = row.roleNames;
+    } else if (typeof row.role_names === "string" && row.role_names) {
+      try {
+        roleNames = JSON.parse(row.role_names);
+      } catch (_) {
+        roleNames = {};
+      }
+    }
+
+    return {
+      id: row.id,
+      snapshotId: row.id,
+      user_id: row.user_id || row.userId,
+      userId: row.user_id || row.userId,
+      loa_id: row.loa_id || row.loaId || null,
+      loaId: row.loa_id || row.loaId || null,
+      role_ids: roleIds,
+      roleIds,
+      role_names: roleNames,
+      roleNames,
+      created_at: row.created_at || row.createdAt,
+      createdAt: row.created_at || row.createdAt,
+      created_by: row.created_by || row.createdBy,
+      createdBy: row.created_by || row.createdBy,
+      restored_at: row.restored_at || row.restoredAt || null,
+      restoredAt: row.restored_at || row.restoredAt || null,
+      restored_by: row.restored_by || row.restoredBy || null,
+      restoredBy: row.restored_by || row.restoredBy || null,
+      restore_reason: row.restore_reason || row.restoreReason || null,
+      restoreReason: row.restore_reason || row.restoreReason || null,
+      status: row.status || "ACTIVE",
+    };
+  }
+
+  /**
+   * Save a pre-LOA role snapshot to persistent SQLite storage.
+   * Enforces safety: never overwrites an existing snapshot with a reduced/empty role list.
+   *
+   * @param {Object} params
+   * @returns {{ success: boolean, snapshot?: Object, preserved?: boolean, overwritten?: boolean, error?: string }}
+   */
+  saveRoleSnapshot({
+    id = `snap_${crypto.randomUUID()}`,
+    userId,
+    loaId = null,
+    roleIds = [],
+    roleNames = {},
+    createdBy = null,
+    createdAt = new Date().toISOString(),
+    status = "ACTIVE",
+  }) {
+    if (!userId) return { success: false, error: "Missing userId" };
+
+    // Prevent overwriting if a snapshot for this loaId already has saved roles
+    if (loaId) {
+      const existing = this.getLatestSnapshotForUser(userId, loaId);
+      if (existing && existing.roleIds?.length > 0 && (!roleIds || roleIds.length === 0)) {
+        return { success: true, snapshot: existing, preserved: true, overwritten: false };
+      }
+    }
+
+    const cleanRoleIds = Array.isArray(roleIds) ? roleIds : [];
+    const roleIdsJson = JSON.stringify(cleanRoleIds);
+    const roleNamesJson = JSON.stringify(roleNames || {});
+    const author = createdBy || userId;
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO loa_role_snapshots
+           (id, user_id, loa_id, role_ids, role_names, created_at, created_by, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          id,
+          userId,
+          loaId,
+          roleIdsJson,
+          roleNamesJson,
+          createdAt,
+          author,
+          status
+        );
+      } catch (err) {
+        console.warn("SQL error saving role snapshot:", err?.message || err);
+      }
+    }
+
+    const record = {
+      id,
+      snapshotId: id,
+      user_id: userId,
+      userId,
+      loa_id: loaId,
+      loaId,
+      role_ids: roleIdsJson,
+      roleIds: cleanRoleIds,
+      role_names: roleNamesJson,
+      roleNames: roleNames || {},
+      created_at: createdAt,
+      createdAt,
+      created_by: author,
+      createdBy: author,
+      restored_at: null,
+      restoredAt: null,
+      restored_by: null,
+      restoredBy: null,
+      restore_reason: null,
+      restoreReason: null,
+      status,
+    };
+
+    this.memorySnapshots.set(id, record);
+
+    return {
+      success: true,
+      snapshot: this._normalizeSnapshot(record),
+      preserved: false,
+      overwritten: true,
+    };
+  }
+
+  /**
+   * Find the newest valid pre-LOA role snapshot for a user.
+   * If loaId is provided, matches that LOA first.
+   * Also falls back to legacy LOA records from staff_loas table.
+   *
+   * @param {string} userId
+   * @param {string|null} [loaId=null]
+   * @returns {Object|null}
+   */
+  getLatestSnapshotForUser(userId, loaId = null) {
+    if (!userId) return null;
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        if (loaId) {
+          const cursor = this.ctx.storage.sql.exec(
+            `SELECT * FROM loa_role_snapshots
+             WHERE user_id = ? AND loa_id = ?
+             ORDER BY created_at DESC LIMIT 1`,
+            userId,
+            loaId
+          );
+          const rows = [...cursor];
+          if (rows.length > 0) return this._normalizeSnapshot(rows[0]);
+        }
+
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM loa_role_snapshots
+           WHERE user_id = ?
+           ORDER BY created_at DESC LIMIT 1`,
+          userId
+        );
+        const rows = [...cursor];
+        if (rows.length > 0) return this._normalizeSnapshot(rows[0]);
+      } catch (_) {}
+    }
+
+    // In-memory fallback
+    const userSnaps = [];
+    for (const snap of this.memorySnapshots.values()) {
+      if (snap.user_id === userId || snap.userId === userId) {
+        userSnaps.push(this._normalizeSnapshot(snap));
+      }
+    }
+    if (userSnaps.length > 0) {
+      if (loaId) {
+        const match = userSnaps.find((s) => s.loa_id === loaId || s.loaId === loaId);
+        if (match) return match;
+      }
+      userSnaps.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+      return userSnaps[0];
+    }
+
+    // Fallback: check staff_loas table for legacy snapshots (handles existing active LOAs)
+    if (this.ctx?.storage?.sql) {
+      try {
+        if (loaId) {
+          const cursor = this.ctx.storage.sql.exec(
+            `SELECT * FROM staff_loas WHERE id = ? AND user_id = ? LIMIT 1`,
+            loaId,
+            userId
+          );
+          const rows = [...cursor];
+          if (rows.length > 0 && rows[0].removed_role_ids) {
+            const row = rows[0];
+            return this._normalizeSnapshot({
+              id: `legacy_${row.id}`,
+              user_id: row.user_id,
+              loa_id: row.id,
+              role_ids: row.removed_role_ids,
+              role_names: "{}",
+              created_at: row.created_at,
+              created_by: row.user_id,
+              status: row.role_swap_status === "completed" ? "ACTIVE" : "COMPLETED",
+            });
+          }
+        }
+
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM staff_loas
+           WHERE user_id = ? AND removed_role_ids IS NOT NULL
+           ORDER BY created_at DESC LIMIT 1`,
+          userId
+        );
+        const rows = [...cursor];
+        if (rows.length > 0) {
+          const row = rows[0];
+          return this._normalizeSnapshot({
+            id: `legacy_${row.id}`,
+            user_id: row.user_id,
+            loa_id: row.id,
+            role_ids: row.removed_role_ids,
+            role_names: "{}",
+            created_at: row.created_at,
+            created_by: row.user_id,
+            status: row.role_swap_status === "completed" ? "ACTIVE" : "COMPLETED",
+          });
+        }
+      } catch (_) {}
+    }
+
+    // Fallback memory LOAs
+    for (const rec of this.memoryLoas.values()) {
+      if (rec.user_id === userId && (rec.removed_role_ids || rec.removedRoleIds?.length > 0)) {
+        return this._normalizeSnapshot({
+          id: `legacy_${rec.id}`,
+          user_id: rec.user_id,
+          loa_id: rec.id,
+          role_ids: rec.removed_role_ids || JSON.stringify(rec.removedRoleIds || []),
+          role_names: "{}",
+          created_at: rec.created_at,
+          created_by: rec.user_id,
+          status: rec.role_swap_status === "completed" ? "ACTIVE" : "COMPLETED",
+        });
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Retrieve a role snapshot by primary ID.
+   * @param {string} snapshotId
+   * @returns {Object|null}
+   */
+  getSnapshotById(snapshotId) {
+    if (!snapshotId) return null;
+
+    if (snapshotId.startsWith("legacy_")) {
+      const loaId = snapshotId.slice("legacy_".length);
+      const loa = this.getLoaById(loaId);
+      if (loa && (loa.removed_role_ids || loa.removedRoleIds?.length > 0)) {
+        return this._normalizeSnapshot({
+          id: snapshotId,
+          user_id: loa.user_id,
+          loa_id: loa.id,
+          role_ids: loa.removed_role_ids || JSON.stringify(loa.removedRoleIds || []),
+          role_names: "{}",
+          created_at: loa.created_at,
+          created_by: loa.user_id,
+          status: loa.role_swap_status === "completed" ? "ACTIVE" : "COMPLETED",
+        });
+      }
+      return null;
+    }
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM loa_role_snapshots WHERE id = ? LIMIT 1`,
+          snapshotId
+        );
+        const rows = [...cursor];
+        if (rows.length > 0) return this._normalizeSnapshot(rows[0]);
+      } catch (_) {}
+    }
+
+    const inMem = this.memorySnapshots.get(snapshotId);
+    return inMem ? this._normalizeSnapshot(inMem) : null;
+  }
+
+  /**
+   * Get role snapshot history for a user, ordered newest first.
+   * Keeps at least the last 3 (or specified limit) snapshots for emergency recovery.
+   *
+   * @param {string} userId
+   * @param {number} [limit=5]
+   * @returns {Array<Object>}
+   */
+  getSnapshotHistoryForUser(userId, limit = 5) {
+    if (!userId) return [];
+    const max = Number(limit) || 5;
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        const cursor = this.ctx.storage.sql.exec(
+          `SELECT * FROM loa_role_snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`,
+          userId,
+          max
+        );
+        const rows = [...cursor];
+        return rows.map((r) => this._normalizeSnapshot(r));
+      } catch (err) {
+        console.warn("SQL error fetching snapshot history:", err?.message || err);
+      }
+    }
+
+    // In-memory fallback
+    const userSnaps = [];
+    for (const snap of this.memorySnapshots.values()) {
+      if (snap.user_id === userId || snap.userId === userId) {
+        userSnaps.push(this._normalizeSnapshot(snap));
+      }
+    }
+    userSnaps.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    return userSnaps.slice(0, max);
+  }
+
+  /**
+   * Update snapshot status (e.g. RESTORED, RECOVERY_USED, ROLLED_BACK).
+   * @param {string} snapshotId
+   * @param {Object} fields
+   * @returns {{ success: boolean, snapshot?: Object, error?: string }}
+   */
+  updateSnapshotStatus(
+    snapshotId,
+    { status, restoredAt = new Date().toISOString(), restoredBy = null, restoreReason = null }
+  ) {
+    if (!snapshotId) return { success: false, error: "Missing snapshotId" };
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE loa_role_snapshots
+           SET status = ?, restored_at = ?, restored_by = ?, restore_reason = ?
+           WHERE id = ?`,
+          status || "RESTORED",
+          restoredAt,
+          restoredBy,
+          restoreReason,
+          snapshotId
+        );
+      } catch (err) {
+        console.warn("SQL error updating snapshot status:", err?.message || err);
+      }
+    }
+
+    const snap = this.memorySnapshots.get(snapshotId) || { id: snapshotId };
+    const updated = {
+      ...snap,
+      status: status || snap.status || "RESTORED",
+      restored_at: restoredAt,
+      restoredAt,
+      restored_by: restoredBy,
+      restoredBy,
+      restore_reason: restoreReason,
+      restoreReason,
+    };
+    this.memorySnapshots.set(snapshotId, updated);
+
+    return { success: true, snapshot: this._normalizeSnapshot(updated) };
+  }
+
+  /**
+   * Close or repair an LOA record after admin recovery has restored roles.
+   *
+   * @param {Object} params
+   * @returns {{ success: boolean, loa?: Object, error?: string }}
+   */
+  repairLoaAfterRecovery({
+    loaId,
+    userId,
+    restoredRoleIds = [],
+    failedRestoreRoleIds = [],
+    restoredBy,
+  }) {
+    if (!loaId) return { success: false, error: "Missing loaId" };
+    const now = new Date().toISOString();
+    const restoredJson = JSON.stringify(restoredRoleIds);
+    const failedJson = JSON.stringify(failedRestoreRoleIds);
+    const notes = `Restored via admin role recovery by ${restoredBy || "admin"}`;
+
+    if (this.ctx?.storage?.sql) {
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE staff_loas
+           SET role_restore_status = 'completed',
+               role_restore_completed_at = ?,
+               ended_at = ?,
+               restored_role_ids = ?,
+               failed_restore_role_ids = ?,
+               notes = ?,
+               updated_at = ?
+           WHERE id = ?`,
+          now,
+          now,
+          restoredJson,
+          failedJson,
+          notes,
+          now,
+          loaId
+        );
+      } catch (err) {
+        console.warn("SQL error repairing LOA after recovery:", err?.message || err);
+      }
+    }
+
+    const existing = this.getLoaById(loaId);
+    if (existing) {
+      const updated = {
+        ...existing,
+        role_restore_status: "completed",
+        role_restore_completed_at: now,
+        ended_at: now,
+        restored_role_ids: restoredJson,
+        failed_restore_role_ids: failedJson,
+        notes,
+        updated_at: now,
+      };
+      this.memoryLoas.set(loaId, updated);
+      return { success: true, loa: normalizeLoaRecord(updated) };
+    }
+
+    return { success: true };
   }
 
   /**
@@ -1820,12 +2292,84 @@ export class StaffLoaDO {
       });
     }
 
-    // 13. /loa/role-snapshot (POST) -> update role snapshot fields
+    // 13. /loa/role-snapshot (POST) -> update role snapshot fields and persist snapshot
     if (request.method === "POST" && url.pathname === "/loa/role-snapshot") {
       const body = await request.json();
-      const result = this.updateLoaRoleSnapshot(body.loaId, body);
+      let snapSaved = null;
+      if (body.userId || body.loaId) {
+        snapSaved = this.saveRoleSnapshot({
+          id: body.snapshotId || (body.loaId ? `snap_${body.loaId}` : undefined),
+          userId: body.userId || (body.loaId ? this.getLoaById(body.loaId)?.user_id : null),
+          loaId: body.loaId,
+          roleIds: body.roleIds || body.removedRoleIds || [],
+          roleNames: body.roleNames || {},
+          createdBy: body.createdBy,
+          createdAt: body.createdAt,
+          status: body.status || (body.roleSwapStatus === "completed" ? "ACTIVE" : "PENDING"),
+        });
+      }
+      let result = { success: true, snapshot: snapSaved?.snapshot };
+      if (body.loaId && this.getLoaById(body.loaId)) {
+        const updateRes = this.updateLoaRoleSnapshot(body.loaId, body);
+        result.success = updateRes.success;
+        if (updateRes.error) result.error = updateRes.error;
+        if (snapSaved?.snapshot) {
+          result.snapshot = snapSaved.snapshot;
+        }
+      }
       return new Response(JSON.stringify(result), {
         status: result.success ? 200 : 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 13b. /loa/role-snapshot/latest (GET) -> retrieve newest pre-LOA snapshot for user
+    if (request.method === "GET" && url.pathname === "/loa/role-snapshot/latest") {
+      const userId = url.searchParams.get("userId") || "";
+      const loaId = url.searchParams.get("loaId") || null;
+      const snapshot = this.getLatestSnapshotForUser(userId, loaId);
+      return new Response(
+        JSON.stringify({ success: Boolean(snapshot), snapshot }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // 13c. /loa/role-snapshot/get (GET) -> retrieve snapshot by primary ID
+    if (request.method === "GET" && url.pathname === "/loa/role-snapshot/get") {
+      const snapshotId = url.searchParams.get("snapshotId") || "";
+      const snapshot = this.getSnapshotById(snapshotId);
+      return new Response(
+        JSON.stringify({ success: Boolean(snapshot), snapshot }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // 13d. /loa/role-snapshot/update (POST) -> update snapshot status
+    if (request.method === "POST" && url.pathname === "/loa/role-snapshot/update") {
+      const body = await request.json();
+      const result = this.updateSnapshotStatus(body.snapshotId, body);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 13e. /loa/admin-recover (POST) -> repair/close broken LOA after admin role recovery
+    if (request.method === "POST" && url.pathname === "/loa/admin-recover") {
+      const body = await request.json();
+      const result = this.repairLoaAfterRecovery(body);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 13f. /loa/role-snapshot/history (GET) -> retrieve user's snapshot history
+    if (request.method === "GET" && url.pathname === "/loa/role-snapshot/history") {
+      const userId = url.searchParams.get("userId") || "";
+      const limit = parseInt(url.searchParams.get("limit") || "5", 10);
+      const history = this.getSnapshotHistoryForUser(userId, limit);
+      return new Response(JSON.stringify({ success: true, history }), {
         headers: { "Content-Type": "application/json" },
       });
     }

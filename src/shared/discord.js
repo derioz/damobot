@@ -352,6 +352,7 @@ export async function sendDiscordChannelMessage({
   embeds,
   message_reference,
   allowed_mentions,
+  flags,
   customFetch = fetch,
 }) {
   const token = env.DISCORD_BOT_TOKEN;
@@ -363,6 +364,7 @@ export async function sendDiscordChannelMessage({
   if (embeds !== undefined) body.embeds = embeds;
   if (message_reference !== undefined) body.message_reference = message_reference;
   if (allowed_mentions !== undefined) body.allowed_mentions = allowed_mentions;
+  if (flags !== undefined) body.flags = flags;
 
   return await customFetch(
     `https://discord.com/api/v10/channels/${channelId}/messages`,

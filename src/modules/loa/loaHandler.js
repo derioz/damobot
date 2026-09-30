@@ -4,6 +4,7 @@ import {
 } from "discord-interactions";
 import {
   parseAndValidateDate,
+  validateLoaDates,
   isoToDisplayDate,
   formatPrettyDate,
   formatPrettyDateRange,
@@ -30,6 +31,7 @@ import {
   DEFAULT_LOA_LOG_CHANNEL_ID,
   loaConfig,
   canManageLOAs,
+  canAdministerLOAs,
   hasStaffLoaRole,
   canViewLoaHistory,
   isLOACenterChannel,
@@ -39,7 +41,12 @@ import { hasStaffRole } from "../../shared/permissions.js";
 import {
   executeLoaRoleSwap,
   executeLoaRoleRestore,
+  executeAdminRoleRestore,
+  executeLoaRoleRollback,
   getGuildRoles,
+  calculateLoaRoleSwapDiff,
+  validateRoleHierarchy,
+  getBotHighestRolePosition,
 } from "./roleUtils.js";
 import {
   logLoaStarted,
@@ -47,6 +54,8 @@ import {
   logLoaWarning,
   logLoaExtended,
   logLoaReasonEdited,
+  logLoaRecovery,
+  logLoaRollback,
 } from "./loaLogger.js";
 import { sendDiscordDM } from "../../shared/discord.js";
 
@@ -103,6 +112,9 @@ export const LoaCustomId = {
   BTN_PAGE_ACTIVE_PREFIX: "loa_page_active:",
   BTN_PAGE_HISTORY_PREFIX: "loa_page_history:",
   CONFIRM_ADMIN_END_PREFIX: "loa_confirm_admin_end:",
+  BTN_RESTORE_ROLES: "loa_btn_restore_roles",
+  SELECT_RESTORE_USER: "loa_select_restore_user",
+  CONFIRM_RESTORE_PREFIX: "loa_confirm_restore:",
   MODAL_START: "loa_modal_start",
   MODAL_EDIT_PREFIX: "loa_modal_edit",
   MODAL_EXTEND_PREFIX: "loa_modal_extend:",
@@ -274,6 +286,28 @@ export function createStringSelect({
     custom_id: customId,
     placeholder,
     options,
+    min_values: minValues,
+    max_values: maxValues,
+    disabled,
+  };
+}
+
+/**
+ * Build a User Select component (Type 5).
+ * @param {Object} options
+ * @returns {Object}
+ */
+export function createUserSelect({
+  customId,
+  placeholder = "Select a staff member...",
+  minValues = 1,
+  maxValues = 1,
+  disabled = false,
+}) {
+  return {
+    type: ComponentType.USER_SELECT,
+    custom_id: customId,
+    placeholder,
     min_values: minValues,
     max_values: maxValues,
     disabled,
@@ -879,7 +913,12 @@ export async function validateLoaAccess(interaction, env) {
     interaction.channel_id || interaction.channel?.id || ""
   ).trim();
 
-  if (!isLOACenterChannel(currentChannelId, env)) {
+  const isEmergencyRestore =
+    interaction.data?.name === "loa" &&
+    interaction.data?.options?.[0]?.name === "restore" &&
+    canAdministerLOAs(interaction, env);
+
+  if (!isEmergencyRestore && !isLOACenterChannel(currentChannelId, env)) {
     const loaChannelId = String(
       env.LOA_CHANNEL_ID || loaConfig.channels?.center || DEFAULT_LOA_CHANNEL_ID
     ).trim();
@@ -906,16 +945,18 @@ export async function validateLoaAccess(interaction, env) {
 
   const doId = env.STAFF_LOA.idFromName(guildId);
   const stub = env.STAFF_LOA.get(doId);
-  const todayIso = getTodayInChicago();
+  const todayIso = interaction.todayIso || env?.TODAY_ISO || env?.MOCK_TODAY_ISO || getTodayInChicago();
 
-  // 4. Role check (Active staff OR Staff currently on LOA with active database record)
+  // 4. Role & Ownership check (Active staff OR Staff currently on LOA with active database record)
   const isStaff =
     canManageLOAs(interaction, env) || hasStaffRole(interaction, env);
 
   const hasLoaRole = hasStaffLoaRole(interaction, env);
   let isOnLoa = false;
+  let activeLoa = null;
 
-  if (!isStaff && hasLoaRole && stub) {
+  // Check if user has an active or open LOA in the database (staff roles are intentionally removed on LOA)
+  if (!isStaff && stub) {
     try {
       const curRes = await stub.fetch(
         `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
@@ -924,9 +965,35 @@ export async function validateLoaAccess(interaction, env) {
         const curData = await curRes.json();
         if (curData?.loa) {
           isOnLoa = true;
+          activeLoa = curData.loa;
         }
       }
     } catch (_) {}
+  }
+
+  // If still not identified as active LOA, check if user is targeting their own LOA via custom_id
+  const customId = interaction.data?.custom_id || "";
+  if (!isStaff && !isOnLoa && stub && customId.includes(":")) {
+    const parts = customId.split(":");
+    const targetLoaId = parts[parts.length - 1];
+    if (targetLoaId && targetLoaId !== "cancel" && targetLoaId !== "return") {
+      try {
+        const getRes = await stub.fetch(
+          `https://do/loa/get?id=${encodeURIComponent(targetLoaId)}`
+        );
+        if (getRes.ok) {
+          const getData = await getRes.json();
+          const targetLoa = getData?.loa;
+          if (
+            targetLoa &&
+            (targetLoa.user_id === userId || targetLoa.ownerDiscordId === userId)
+          ) {
+            isOnLoa = true;
+            activeLoa = targetLoa;
+          }
+        }
+      } catch (_) {}
+    }
   }
 
   if (!isStaff && !isOnLoa) {
@@ -958,6 +1025,8 @@ export async function validateLoaAccess(interaction, env) {
     todayIso,
     isStaff,
     isOnLoa,
+    hasLoaRole,
+    activeLoa,
     memberRoles: interaction.member?.roles || [],
   };
 }
@@ -1040,50 +1109,10 @@ export async function executeLoaStart({
   ctx = null,
   memberRoles = [],
 }) {
+  // Step 1: Receive LOA request & Step 2: Validate all fields
   if (!startDateVal || !endDateVal || !reasonVal) {
     return ephemeralTextResponse(
       "❌ Missing required fields. Please supply start_date, end_date, and reason."
-    );
-  }
-
-  const parsedStart = parseAndValidateDate(startDateVal, todayIso);
-  if (!parsedStart.valid) {
-    return ephemeralTextResponse(
-      `❌ Invalid Start Date\n\n${parsedStart.error || "Please enter a valid date, for example:\n`9/5/2026`, `09/05/2026`, or `9/5`"}`
-    );
-  }
-
-  const parsedEnd = parseAndValidateDate(endDateVal, todayIso);
-  if (!parsedEnd.valid) {
-    return ephemeralTextResponse(
-      `❌ Invalid End Date\n\n${parsedEnd.error || "Please enter a valid date, for example:\n`9/12/2026`, `09/12/2026`, or `9/12`"}`
-    );
-  }
-
-  if (parsedEnd.isoDate < parsedStart.isoDate) {
-    return ephemeralTextResponse("❌ End date cannot be before start date.");
-  }
-
-  // Duration validation from loaConfig.settings
-  const startDateObj = new Date(`${parsedStart.isoDate}T00:00:00Z`);
-  const endDateObj = new Date(`${parsedEnd.isoDate}T00:00:00Z`);
-  const durationDays =
-    Math.round((endDateObj - startDateObj) / (1000 * 60 * 60 * 24)) + 1;
-
-  if (
-    loaConfig.settings?.minimumDays &&
-    durationDays < loaConfig.settings.minimumDays
-  ) {
-    return ephemeralTextResponse(
-      `❌ LOA duration must be at least ${loaConfig.settings.minimumDays} day${loaConfig.settings.minimumDays === 1 ? "" : "s"}.`
-    );
-  }
-  if (
-    loaConfig.settings?.maximumDays &&
-    durationDays > loaConfig.settings.maximumDays
-  ) {
-    return ephemeralTextResponse(
-      `❌ LOA duration cannot exceed ${loaConfig.settings.maximumDays} days.`
     );
   }
 
@@ -1092,37 +1121,94 @@ export async function executeLoaStart({
     return ephemeralTextResponse("❌ Reason cannot be empty.");
   }
 
-  // Determine if LOA starts today (immediately active)
-  const isStartingToday = parsedStart.isoDate <= todayIso;
-  let nicknameModified = 0;
-  let nicknameWarning = false;
-  let loaNickname = null;
+  // Step 3: Validate start/end dates before ANY role or state changes
+  const dateValidation = validateLoaDates({
+    startDateStr: startDateVal,
+    endDateStr: endDateVal,
+    todayIso,
+    minDays: loaConfig.settings?.minimumDays,
+    maxDays: loaConfig.settings?.maximumDays,
+  });
 
-  if (isStartingToday) {
-    const baseName = memberNick || displayName;
-    loaNickname = formatLoaNickname(baseName);
-    const modRes = await modifyGuildMemberNickname({
-      env,
-      guildId,
-      userId,
-      newNickname: loaNickname,
-      reason: "Staff LOA started",
-      customFetch,
-    });
+  if (!dateValidation.valid) {
+    // If validation fails:
+    // - DO NOT REMOVE ANY ROLES
+    // - DO NOT ADD THE LOA ROLE
+    // - DO NOT CREATE A PARTIAL ACTIVE LOA
+    // - SHOW THE USER A CLEAR ERROR
+    // - KEEP THEIR CURRENT ROLES UNCHANGED
+    return ephemeralTextResponse(`❌ ${dateValidation.error}`);
+  }
 
-    if (modRes.success) {
-      nicknameModified = 1;
-    } else {
-      nicknameWarning = true;
-      if (env?.ENVIRONMENT !== "test" && process.env?.NODE_ENV !== "test") {
-        console.warn(`Could not update nickname for user ${userId}:`, modRes.error);
+  const parsedStartIso = dateValidation.startDate;
+  const parsedEndIso = dateValidation.endDate;
+  const isStartingToday = parsedStartIso <= todayIso;
+
+  // Step 4: Check for an existing active LOA
+  if (stub && typeof stub.fetch === "function") {
+    try {
+      const curRes = await stub.fetch(
+        `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
+      );
+      if (curRes.ok) {
+        const curData = await curRes.json();
+        if (curData?.loa) {
+          return ephemeralTextResponse(
+            "❌ You already have an active or upcoming LOA. You can only have one active or upcoming LOA at a time.\n\nUse My LOA to manage it."
+          );
+        }
       }
+    } catch (err) {
+      console.error("Error checking existing active LOA:", err);
     }
   }
 
+  // Step 5: Verify the user is eligible & capture current role list
+  let currentMemberRoles = Array.isArray(memberRoles) && memberRoles.length > 0 ? memberRoles : [];
+  if (currentMemberRoles.length === 0) {
+    const memRes = await getGuildMember({ env, guildId, userId, customFetch });
+    if (memRes.success && memRes.member?.roles) {
+      currentMemberRoles = memRes.member.roles;
+    }
+  }
+
+  // Step 6: Capture the user's current role snapshot (with role names for display/logging)
+  const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+  const roleMap = rolesRes.roleMap || new Map();
+  const roleNames = {};
+  for (const roleId of currentMemberRoles) {
+    roleNames[roleId] = roleMap.get(roleId)?.name || roleId;
+  }
+
   const newLoaId = crypto.randomUUID();
+  const snapshotId = `snap_${newLoaId}`;
 
   try {
+    // Step 7: Persist the role snapshot in SQLite first
+    if (stub && typeof stub.fetch === "function") {
+      const snapSaveRes = await stub.fetch("https://do/loa/role-snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: snapshotId,
+          userId,
+          loaId: newLoaId,
+          roleIds: currentMemberRoles,
+          roleNames,
+          createdBy: userId,
+          status: "ACTIVE",
+        }),
+      });
+
+      const snapSaveData = await snapSaveRes.json().catch(() => ({}));
+      if (!snapSaveRes.ok || !snapSaveData.success) {
+        return ephemeralTextResponse(
+          `❌ Failed to save role snapshot restore point: ${snapSaveData.error || "Storage error"}. No roles were changed.`
+        );
+      }
+    }
+
+    // Step 8: Create/save the LOA record
     const createRes = await stub.fetch("https://do/loa/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1131,30 +1217,32 @@ export async function executeLoaStart({
         guildId,
         userId,
         displayName,
-        startDate: parsedStart.isoDate,
-        endDate: parsedEnd.isoDate,
+        startDate: parsedStartIso,
+        endDate: parsedEndIso,
         reason: trimmedReason,
         notes: notesVal?.trim() || null,
         todayIso,
         originalNickname: memberNick,
-        loaNickname,
-        nicknameModified,
+        loaNickname: null,
+        nicknameModified: 0,
+        status: isStartingToday ? "ACTIVE" : "UPCOMING",
       }),
     });
 
-    const data = await createRes.json();
+    const data = await createRes.json().catch(() => ({}));
 
+    // Step 9: Confirm storage succeeded
     if (!createRes.ok || !data.success) {
-      // Revert nickname change if record creation failed
-      if (nicknameModified) {
-        await modifyGuildMemberNickname({
-          env,
-          guildId,
-          userId,
-          newNickname: memberNick,
-          reason: "Staff LOA start failed - rollback",
-          customFetch,
-        });
+      if (stub && typeof stub.fetch === "function") {
+        await stub.fetch("https://do/loa/role-snapshot/update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            snapshotId,
+            status: "FAILED",
+            restoreReason: "LOA start creation failed",
+          }),
+        }).catch(() => {});
       }
 
       if (data.error === "ALREADY_EXISTS") {
@@ -1162,59 +1250,109 @@ export async function executeLoaStart({
           "❌ You already have an active or upcoming LOA. You can only have one active or upcoming LOA at a time.\n\nUse My LOA to manage it."
         );
       }
-      return ephemeralTextResponse(`❌ Failed to submit LOA: ${data.error || "Unknown error"}`);
+      return ephemeralTextResponse(`❌ Failed to submit LOA: ${data.error || "Unknown error"}. No roles were changed.`);
     }
 
+    // Steps 10 & 11: Remove applicable staff roles & Add LOA role (if starting today)
     let roleSwapResult = null;
+    let nicknameModified = 0;
+    let nicknameWarning = false;
+    let loaNickname = null;
+
     if (isStartingToday) {
-      roleSwapResult = await executeLoaRoleSwap({
+      const baseName = memberNick || displayName;
+      loaNickname = formatLoaNickname(baseName);
+      const modRes = await modifyGuildMemberNickname({
         env,
         guildId,
         userId,
-        currentMemberRoles: memberRoles,
-        stub,
-        loaId: newLoaId,
+        newNickname: loaNickname,
+        reason: "Staff LOA started",
         customFetch,
       });
 
-      if (!roleSwapResult.success) {
-        // Rollback nickname if modified
-        if (nicknameModified) {
-          await modifyGuildMemberNickname({
-            env,
-            guildId,
-            userId,
-            newNickname: memberNick,
-            reason: "Staff LOA start failed - rollback",
-            customFetch,
-          });
-        }
-
-        // Cancel the created LOA in DO so member is not stuck on LOA
-        await stub.fetch("https://do/loa/cancel", {
+      if (modRes.success) {
+        nicknameModified = 1;
+        await stub.fetch("https://do/loa/nickname-state", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ loaId: newLoaId, userId }),
-        });
+          body: JSON.stringify({
+            loaId: newLoaId,
+            loaNickname,
+            nicknameModified: 1,
+          }),
+        }).catch(() => {});
+      } else {
+        nicknameWarning = true;
+        if (env?.ENVIRONMENT !== "test" && process.env?.NODE_ENV !== "test") {
+          console.warn(`Could not update nickname for user ${userId}:`, modRes.error);
+        }
+      }
 
-        // Audit log the failure/warning
-        await logLoaWarning({
+      try {
+        roleSwapResult = await executeLoaRoleSwap({
           env,
           guildId,
           userId,
-          message: `Role swap failed during LOA start for ${displayName} (<@${userId}>): ${roleSwapResult.error}`,
+          currentMemberRoles,
+          stub,
+          loaId: newLoaId,
+          customFetch,
+        });
+      } catch (swapErr) {
+        roleSwapResult = {
+          success: false,
+          error: swapErr?.message || "Unexpected role swap error",
+        };
+      }
+
+      // Step 12: Confirm all Discord role changes succeeded; automatic rollback on failure
+      if (!roleSwapResult.success) {
+        await executeLoaRoleRollback({
+          env,
+          guildId,
+          userId,
+          originalRoles: currentMemberRoles,
+          assignedLoaRoleId: roleSwapResult?.staffLoaRoleId || roleSwapResult?.assignedLoaRoleId,
+          memberNick,
+          originalError: roleSwapResult.error || "Role swap failed",
+          stub,
+          loaId: newLoaId,
+          snapshotId,
+          customFetch,
+        });
+
+        await logLoaRollback({
+          env,
+          guildId,
+          userId,
+          loaId: newLoaId,
+          snapshotId,
+          error: roleSwapResult.error || "Role swap failed",
+          restoredRoleIds: currentMemberRoles,
           customFetch,
         }).catch(() => {});
 
         return ephemeralTextResponse(
-          `❌ Leave of Absence could not be started:\n\n${roleSwapResult.error || "Role swap failed."}\n\nNo roles were removed and your LOA was cancelled.`
+          `❌ Leave of Absence could not be started:\n\n${roleSwapResult.error || "Role swap failed."}\n\nYour original roles and nickname were automatically restored and the LOA was rolled back.`
         );
       }
-
     }
 
-    const startUnix = isoToDiscordTimestamp(parsedStart.isoDate, { timeOfDay: "start" });
-    const endUnix = isoToDiscordTimestamp(parsedEnd.isoDate, { timeOfDay: "noon" });
+    // Step 13: Mark the LOA fully active
+    if (stub && typeof stub.fetch === "function") {
+      await stub.fetch("https://do/loa/role-snapshot/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          snapshotId,
+          status: "ACTIVE",
+        }),
+      }).catch(() => {});
+    }
+
+    const startUnix = isoToDiscordTimestamp(parsedStartIso, { timeOfDay: "start" });
+    const endUnix = isoToDiscordTimestamp(parsedEndIso, { timeOfDay: "noon" });
 
     // Background non-blocking tasks: Discord audit log, public dashboard repost, and staff member DM
     const backgroundTasks = async () => {
@@ -1229,8 +1367,8 @@ export async function executeLoaStart({
             guild_id: guildId,
             user_id: userId,
             display_name: displayName,
-            start_date: parsedStart.isoDate,
-            end_date: parsedEnd.isoDate,
+            start_date: parsedStartIso,
+            end_date: parsedEndIso,
             reason: trimmedReason,
           },
           removedRoleIds: roleSwapResult.removedRoleIds || [],
@@ -1285,7 +1423,7 @@ export async function executeLoaStart({
       `**Staff Member:** <@${userId}>`,
       `**Started:** <t:${startUnix}:D> (<t:${startUnix}:R>)`,
       `**Expected Return:** <t:${endUnix}:D> (<t:${endUnix}:R>)`,
-      `**Scheduled:** ${formatPrettyDateRange(parsedStart.isoDate, parsedEnd.isoDate)}`,
+      `**Scheduled:** ${formatPrettyDateRange(parsedStartIso, parsedEndIso)}`,
       `**Reason:** ${trimmedReason}`,
     ];
     if (notesVal && notesVal.trim()) {
@@ -1389,6 +1527,9 @@ export async function executeLoaEdit({
           `❌ Invalid Start Date\n\n${parsed.error || "Please enter a valid date, for example:\n`9/5/2026`, `09/05/2026`, or `9/5`"}`
         );
       }
+      if (parsed.isoDate < todayIso && existing.start_date >= todayIso) {
+        return ephemeralTextResponse("❌ Start date cannot be before today.");
+      }
       newStartDateIso = parsed.isoDate;
     }
 
@@ -1398,6 +1539,9 @@ export async function executeLoaEdit({
         return ephemeralTextResponse(
           `❌ Invalid End Date\n\n${parsed.error || "Please enter a valid date, for example:\n`9/12/2026`, `09/12/2026`, or `9/12`"}`
         );
+      }
+      if (parsed.isoDate < todayIso) {
+        return ephemeralTextResponse("❌ Return date cannot be before today.");
       }
       newEndDateIso = parsed.isoDate;
     }
@@ -1706,8 +1850,350 @@ export async function executeLoaCancelOrReturn({
 }
 
 /**
+ * Render admin select prompt to choose a user to recover pre-LOA roles for.
+ *
+ * @param {Object} params
+ * @param {Object} params.stub
+ * @param {Object} params.env
+ * @param {string} params.guildId
+ * @param {string} params.adminUserId
+ * @returns {Response}
+ */
+export function renderAdminRecoverySelectPrompt({
+  stub,
+  env,
+  guildId,
+  adminUserId,
+}) {
+  const container = createContainer([
+    createTextDisplay("# 🛠️ Restore Staff Roles\n### Admin Role Recovery"),
+    createTextDisplay(
+      "Select a staff member below to locate their latest pre-LOA role snapshot and safely recover their staff roles.\n\n" +
+      "-# ℹ️ DamoBot will display a confirmation preview showing all roles that will be restored before making any changes."
+    ),
+    createSeparator(true, 1),
+    createActionRow([
+      createUserSelect({
+        customId: LoaCustomId.SELECT_RESTORE_USER,
+        placeholder: "Select a staff member to restore...",
+      }),
+    ]),
+    createSeparator(true, 1),
+    createActionRow([
+      createButton({
+        customId: LoaCustomId.CANCEL_DISMISS,
+        label: "Cancel",
+        style: ButtonStyle.SECONDARY,
+      }),
+    ]),
+    createSeparator(true, 1),
+    buildDamoFooter({ productName: "Staff LOA Manager" }),
+  ]);
+
+  return ephemeralComponentsResponse([container]);
+}
+
+/**
+ * Render the role recovery confirmation screen displaying which roles will be restored,
+ * which will be skipped (non-existent), and requiring admin confirmation before touching Discord.
+ *
+ * @param {Object} params
+ * @param {Object} params.stub
+ * @param {Object} params.env
+ * @param {string} params.guildId
+ * @param {string} params.targetUserId
+ * @param {string} params.adminUserId
+ * @param {Function} [params.customFetch=fetch]
+ * @returns {Promise<Response>}
+ */
+export async function renderAdminRecoveryConfirmation({
+  stub,
+  env,
+  guildId,
+  targetUserId,
+  adminUserId,
+  customFetch = fetch,
+}) {
+  try {
+    // 1. Fetch latest pre-LOA role snapshot from DO
+    const snapRes = await stub.fetch(
+      `https://do/loa/role-snapshot/latest?userId=${encodeURIComponent(targetUserId)}`
+    );
+    const snapData = await snapRes.json().catch(() => ({}));
+    const snapshot = snapData?.snapshot;
+
+    const roleIds = Array.isArray(snapshot?.roleIds)
+      ? snapshot.roleIds
+      : Array.isArray(snapshot?.role_ids)
+      ? snapshot.role_ids
+      : typeof snapshot?.role_ids === "string"
+      ? JSON.parse(snapshot.role_ids)
+      : [];
+
+    if (!snapshot || roleIds.length === 0) {
+      return ephemeralTextResponse(
+        `❌ No pre-LOA role snapshot found for <@${targetUserId}> (ID: ${targetUserId}).\n\nThere is no saved restore point available for this user.`
+      );
+    }
+
+    // 2. Fetch target member and current server roles
+    const [memberRes, rolesRes] = await Promise.all([
+      getGuildMember({ env, guildId, userId: targetUserId, customFetch }),
+      getGuildRoles({ env, guildId, customFetch }),
+    ]);
+
+    if (!memberRes.success || !memberRes.member) {
+      return ephemeralTextResponse(
+        `❌ Could not locate Discord member <@${targetUserId}> (ID: ${targetUserId}) in this server. The user may have left.`
+      );
+    }
+
+    const roleMap = rolesRes.roleMap || new Map();
+    const currentMemberRoles = memberRes.member.roles || [];
+    const memberName =
+      memberRes.member.nick ||
+      memberRes.member.user?.global_name ||
+      memberRes.member.user?.username ||
+      targetUserId;
+
+    // 3. Classify snapshot roles
+    const rolesToRestore = [];
+    const rolesSkippedNonexistent = [];
+    const rolesAlreadyPresent = [];
+
+    for (const roleId of roleIds) {
+      if (!roleMap.has(roleId)) {
+        rolesSkippedNonexistent.push({
+          roleId,
+          roleName: snapshot.role_names?.[roleId] || roleId,
+        });
+      } else if (currentMemberRoles.includes(roleId)) {
+        rolesAlreadyPresent.push({
+          roleId,
+          roleName: roleMap.get(roleId)?.name || roleId,
+        });
+      } else {
+        rolesToRestore.push({
+          roleId,
+          roleName: roleMap.get(roleId)?.name || roleId,
+        });
+      }
+    }
+
+    const restoreLines = [
+      "# 🛠️ LOA Role Recovery",
+      `**Staff Member:** ${memberName} (<@${targetUserId}>)`,
+      `**Discord ID:** \`${targetUserId}\``,
+      `**LOA ID:** \`${snapshot.loa_id || "N/A"}\``,
+      `**Snapshot ID:** \`${snapshot.id}\``,
+      "",
+      "### Roles to restore:",
+      rolesToRestore.length > 0
+        ? rolesToRestore.map((r) => `- **${r.roleName}**`).join("\n")
+        : "*(User already has all active saved roles)*",
+    ];
+
+    if (rolesSkippedNonexistent.length > 0) {
+      restoreLines.push(
+        "",
+        "### ⚠️ Roles skipped (no longer exist in server):",
+        rolesSkippedNonexistent
+          .map((r) => `- ${r.roleName} (ID: \`${r.roleId}\`) • *Role no longer exists*`)
+          .join("\n")
+      );
+    }
+
+    if (rolesAlreadyPresent.length > 0) {
+      restoreLines.push(
+        "",
+        "-# ℹ️ Already present on member: " +
+          rolesAlreadyPresent.map((r) => r.roleName).join(", ")
+      );
+    }
+
+    restoreLines.push(
+      "",
+      "**LOA role will be removed.**",
+      "Restoration will safely restore missing pre-LOA roles while keeping any roles gained after going on LOA."
+    );
+
+    const container = createContainer([
+      createTextDisplay(restoreLines.join("\n")),
+      createSeparator(true, 1),
+      createActionRow([
+        createButton({
+          customId: LoaCustomId.CANCEL_DISMISS,
+          label: "Cancel",
+          style: ButtonStyle.SECONDARY,
+        }),
+        createButton({
+          customId: `${LoaCustomId.CONFIRM_RESTORE_PREFIX}${snapshot.id}:${targetUserId}`,
+          label: "Confirm Restore",
+          style: ButtonStyle.SUCCESS,
+          emoji: "🔄",
+        }),
+      ]),
+      createSeparator(true, 1),
+      buildDamoFooter({ productName: "Staff LOA Manager" }),
+    ]);
+
+    return ephemeralComponentsResponse([container]);
+  } catch (err) {
+    console.error("Error rendering admin recovery confirmation:", err);
+    return ephemeralTextResponse(
+      `❌ Error preparing role recovery: ${err.message || "Internal error"}`
+    );
+  }
+}
+
+/**
+ * Handle confirmation of admin role recovery.
+ * Calls executeAdminRoleRestore, logs audit event, refreshes public dashboard, and responds.
+ *
+ * @param {Object} params
+ * @param {Object} params.interaction
+ * @param {Object} params.env
+ * @param {string} params.customId
+ * @param {Object} params.stub
+ * @param {string} params.todayIso
+ * @param {Function} [params.customFetch=fetch]
+ * @param {Object} [params.ctx]
+ * @returns {Promise<Response>}
+ */
+export async function handleAdminRoleRestoreConfirm({
+  interaction,
+  env,
+  customId,
+  stub,
+  todayIso,
+  customFetch = fetch,
+  ctx = null,
+}) {
+  if (!canAdministerLOAs(interaction, env)) {
+    return ephemeralTextResponse(
+      "❌ Permission denied. You do not have permission to restore staff roles. Only Management and Administrators can restore staff roles."
+    );
+  }
+
+  const payload = customId.slice(LoaCustomId.CONFIRM_RESTORE_PREFIX.length);
+  const colonIdx = payload.indexOf(":");
+  let snapshotId = null;
+  let targetUserId = payload;
+  if (colonIdx !== -1) {
+    snapshotId = payload.slice(0, colonIdx);
+    targetUserId = payload.slice(colonIdx + 1);
+  }
+  const guildId =
+    interaction.guild_id ||
+    interaction.member?.guild_id ||
+    env?.DISCORD_GUILD_ID ||
+    env?.GUILD_ID;
+  const adminUserId = interaction.member?.user?.id || interaction.user?.id;
+
+  try {
+    const restoreResult = await executeAdminRoleRestore({
+      env,
+      guildId,
+      targetUserId,
+      adminUserId,
+      snapshotId,
+      stub,
+      customFetch,
+    });
+
+    if (!restoreResult.success) {
+      return ephemeralTextResponse(
+        `❌ Role recovery failed: ${restoreResult.error || "Unknown error"}`
+      );
+    }
+
+    const rolesRes = await getGuildRoles({ env, guildId, customFetch });
+    const roleMap = rolesRes.roleMap || new Map();
+
+    // Background tasks: audit log & dashboard refresh
+    const backgroundTasks = async () => {
+      await logLoaRecovery({
+        env,
+        guildId,
+        targetUserId,
+        adminUserId,
+        loaId: restoreResult.loaId || restoreResult.snapshot?.loa_id || restoreResult.snapshot?.loaId,
+        snapshotId: restoreResult.snapshot?.id || snapshotId,
+        restoredRoleIds: restoreResult.restoredRoleIds || [],
+        skippedRoles: restoreResult.skippedRoles || [],
+        loaRoleRemoved: restoreResult.loaRoleRemoved,
+        recoveryType: "Manual Admin Recovery",
+        roleMap,
+        customFetch,
+      }).catch((err) => {
+        console.warn("Failed to dispatch logLoaRecovery embed:", err);
+      });
+
+      await refreshPublicLoaList({
+        env,
+        guildId,
+        todayIso,
+        recentActivity: `🔄 Staff roles restored for <@${targetUserId}> • just now`,
+        repost: true,
+        ctx,
+      }).catch((err) => {
+        console.warn("Failed to refresh public LOA list:", err);
+      });
+    };
+
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(backgroundTasks());
+    } else {
+      await backgroundTasks();
+    }
+
+    const restoredNames = (restoreResult.restoredRoleIds || []).map(
+      (id) => `- **${roleMap.get(id)?.name || id}**`
+    );
+    const skippedLines = (restoreResult.skippedRoles || []).map(
+      (s) => `- ${s.roleName || s.roleId}: *${s.reason}*`
+    );
+
+    const successLines = [
+      "# ✅ Staff Roles Restored",
+      `Successfully recovered and restored pre-LOA roles for <@${targetUserId}>!`,
+      "",
+      `**Restored Roles (${restoreResult.restoredRoleIds.length}):**`,
+      restoredNames.length > 0 ? restoredNames.join("\n") : "*(None needed)*",
+    ];
+
+    if (skippedLines.length > 0) {
+      successLines.push(
+        "",
+        `**Skipped Roles (${skippedLines.length}):**`,
+        skippedLines.join("\n")
+      );
+    }
+
+    successLines.push(
+      "",
+      `**LOA Role Removed:** ${restoreResult.loaRoleRemoved ? "Yes" : "No"}`,
+      `**Restored By:** <@${adminUserId}>`
+    );
+
+    const container = createContainer([
+      createTextDisplay(successLines.join("\n")),
+      createSeparator(true, 1),
+      buildDamoFooter({ productName: "Staff LOA Manager" }),
+    ]);
+
+    return updateComponentsResponse([container]);
+  } catch (err) {
+    console.error("Error executing admin role recovery:", err);
+    return ephemeralTextResponse(
+      `❌ Error during role recovery: ${err.message || "Internal error"}`
+    );
+  }
+}
+
+/**
  * Handle all /loa application commands.
- * The only registered command is /loa list.
+ * The only registered command is /loa list and /loa restore.
  * Refreshes the permanent dashboard and responds ephemerally.
  *
  * @param {Object} interaction
@@ -1725,6 +2211,31 @@ export async function handleLoaCommand(interaction, env, ctx) {
   const subCommand = interaction.data?.options?.[0];
   const subCommandName = subCommand?.name;
   const options = subCommand?.options || [];
+
+  // SUBCOMMAND: /loa restore user:@User (Admin recovery)
+  if (subCommandName === "restore") {
+    if (!canAdministerLOAs(interaction, env)) {
+      return ephemeralTextResponse(
+        "❌ Permission denied. You do not have permission to restore staff roles. Only Management and Administrators can restore staff roles."
+      );
+    }
+    const userOption =
+      options.find((opt) => opt.name === "user") ||
+      options.find((opt) => opt.type === 6) ||
+      options[0];
+    const targetUserId = userOption?.value;
+    if (!targetUserId) {
+      return ephemeralTextResponse("❌ Please specify a staff member whose roles to restore.");
+    }
+    return await renderAdminRecoveryConfirmation({
+      stub,
+      env,
+      guildId,
+      targetUserId,
+      adminUserId: userId,
+      customFetch: fetch,
+    });
+  }
 
   // SUBCOMMAND: /loa info member:@User
   if (subCommandName === "info") {
@@ -1977,28 +2488,40 @@ export async function renderActiveLoasDashboard({
     const activeData = await activeRes.json();
     const loas = activeData?.loas || [];
 
-    const isManager = canManageLOAs(interaction, env);
+    const isManager = canAdministerLOAs(interaction, env);
 
     if (loas.length === 0) {
+      const emptyButtons = [
+        createButton({
+          customId: LoaCustomId.BTN_START,
+          label: "Start LOA",
+          style: ButtonStyle.PRIMARY,
+          emoji: "🏖️",
+        }),
+        createButton({
+          customId: LoaCustomId.BTN_STATUS,
+          label: "My LOA",
+          style: ButtonStyle.SECONDARY,
+          emoji: "👤",
+        }),
+      ];
+      if (isManager) {
+        emptyButtons.push(
+          createButton({
+            customId: LoaCustomId.BTN_RESTORE_ROLES,
+            label: "Restore Staff Roles",
+            style: ButtonStyle.SECONDARY,
+            emoji: "🔄",
+          })
+        );
+      }
+
       const container = createContainer([
         createTextDisplay("# 📋 Active Staff LOAs"),
         createSeparator(true, 1),
         createTextDisplay("🟢 There are currently no active or overdue staff LOAs."),
         createSeparator(true, 1),
-        createActionRow([
-          createButton({
-            customId: LoaCustomId.BTN_START,
-            label: "Start LOA",
-            style: ButtonStyle.PRIMARY,
-            emoji: "🏖️",
-          }),
-          createButton({
-            customId: LoaCustomId.BTN_STATUS,
-            label: "My LOA",
-            style: ButtonStyle.SECONDARY,
-            emoji: "👤",
-          }),
-        ]),
+        createActionRow(emptyButtons),
         createSeparator(true, 1),
         buildDamoFooter({ productName: "Staff LOA Manager" }),
       ]);
@@ -2080,6 +2603,16 @@ export async function renderActiveLoasDashboard({
             customId: LoaCustomId.SELECT_ADMIN_TARGET,
             placeholder: "Select a staff member to manage...",
             options: selectOptions,
+          }),
+        ])
+      );
+      innerComponents.push(
+        createActionRow([
+          createButton({
+            customId: LoaCustomId.BTN_RESTORE_ROLES,
+            label: "Restore Staff Roles",
+            style: ButtonStyle.SECONDARY,
+            emoji: "🔄",
           }),
         ])
       );
@@ -2245,6 +2778,12 @@ export async function renderAdminLoaDetailsPanel({
     }
 
     adminButtons.push(
+      createButton({
+        customId: `${LoaCustomId.CONFIRM_RESTORE_PREFIX}auto:${staff.user_id}`,
+        label: "Restore Staff Roles",
+        style: ButtonStyle.SECONDARY,
+        emoji: "🔄",
+      }),
       createButton({
         customId: `${LoaCustomId.BTN_ADMIN_HISTORY_PREFIX}${staff.user_id}`,
         label: "LOA History",
@@ -2453,6 +2992,7 @@ export async function executeLoaExtend({
   todayIso,
   customFetch = fetch,
   ctx = null,
+  interaction = null,
 }) {
   if (!newEndDateVal) {
     return ephemeralTextResponse("❌ Please provide a new return date.");
@@ -2467,6 +3007,23 @@ export async function executeLoaExtend({
     return ephemeralTextResponse(
       `❌ New return date must be in the future (after today, ${todayIso}).`
     );
+  }
+
+  // Check LOA ownership: owners can manage their own LOA without staff roles; managing other users requires management/admin
+  if (stub && interaction) {
+    try {
+      const getRes = await stub.fetch(`https://do/loa/get?id=${encodeURIComponent(loaId)}`);
+      if (getRes.ok) {
+        const getData = await getRes.json().catch(() => ({}));
+        const targetLoa = getData?.loa;
+        if (targetLoa) {
+          const isOwner = targetLoa.user_id === userId || targetLoa.ownerDiscordId === userId;
+          if (!isOwner && !canViewLoaHistory(interaction, env)) {
+            return ephemeralTextResponse("❌ Permission denied. You can only extend your own LOA.");
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   const extRes = await stub.fetch("https://do/loa/extend", {
@@ -2558,10 +3115,28 @@ export async function executeLoaEditReason({
   todayIso,
   customFetch = fetch,
   ctx = null,
+  interaction = null,
 }) {
   const trimmed = (newReasonVal || "").trim();
   if (!trimmed) {
     return ephemeralTextResponse("❌ Reason cannot be empty.");
+  }
+
+  // Check LOA ownership: owners can manage their own LOA without staff roles; managing other users requires management/admin
+  if (stub && interaction) {
+    try {
+      const getRes = await stub.fetch(`https://do/loa/get?id=${encodeURIComponent(loaId)}`);
+      if (getRes.ok) {
+        const getData = await getRes.json().catch(() => ({}));
+        const targetLoa = getData?.loa;
+        if (targetLoa) {
+          const isOwner = targetLoa.user_id === userId || targetLoa.ownerDiscordId === userId;
+          if (!isOwner && !canViewLoaHistory(interaction, env)) {
+            return ephemeralTextResponse("❌ Permission denied. You can only edit your own LOA reason.");
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   const editRes = await stub.fetch("https://do/loa/edit-reason", {
@@ -2837,6 +3412,72 @@ export async function handleLoaComponent(interaction, env, ctx) {
 
   const { guildId, userId, displayName, stub, todayIso } = access;
   const customId = interaction.data?.custom_id || "";
+
+  // 0a. BUTTON: Restore Staff Roles (Admin UI Recovery prompt)
+  if (customId === LoaCustomId.BTN_RESTORE_ROLES) {
+    if (!canAdministerLOAs(interaction, env)) {
+      return ephemeralTextResponse(
+        "❌ Permission denied. You do not have permission to restore staff roles. Only Management and Administrators can restore staff roles."
+      );
+    }
+    return renderAdminRecoverySelectPrompt({
+      stub,
+      env,
+      guildId,
+      adminUserId: userId,
+    });
+  }
+
+  // 0b. SELECT: User to restore roles for (Admin Recovery)
+  if (customId === LoaCustomId.SELECT_RESTORE_USER) {
+    if (!canAdministerLOAs(interaction, env)) {
+      return ephemeralTextResponse(
+        "❌ Permission denied. You do not have permission to restore staff roles. Only Management and Administrators can restore staff roles."
+      );
+    }
+    const targetUserId = interaction.data?.values?.[0];
+    if (!targetUserId) {
+      return ephemeralTextResponse("❌ Please select a staff member to restore.");
+    }
+    return await renderAdminRecoveryConfirmation({
+      stub,
+      env,
+      guildId,
+      targetUserId,
+      adminUserId: userId,
+      customFetch: fetch,
+    });
+  }
+
+  // 0c. BUTTON: Confirm Restore Staff Roles (Admin Recovery)
+  if (customId.startsWith(LoaCustomId.CONFIRM_RESTORE_PREFIX)) {
+    if (!canAdministerLOAs(interaction, env)) {
+      return ephemeralTextResponse(
+        "❌ Permission denied. You do not have permission to restore staff roles. Only Management and Administrators can restore staff roles."
+      );
+    }
+    const payload = customId.slice(LoaCustomId.CONFIRM_RESTORE_PREFIX.length);
+    if (payload.startsWith("auto:")) {
+      const targetUserId = payload.slice("auto:".length);
+      return await renderAdminRecoveryConfirmation({
+        stub,
+        env,
+        guildId,
+        targetUserId,
+        adminUserId: userId,
+        customFetch: fetch,
+      });
+    }
+    return await handleAdminRoleRestoreConfirm({
+      interaction,
+      env,
+      customId,
+      stub,
+      todayIso,
+      customFetch: fetch,
+      ctx,
+    });
+  }
 
   // 1. BUTTON: Start LOA -> opens private modal
   if (customId === LoaCustomId.BTN_START) {
@@ -3301,10 +3942,31 @@ export async function handleLoaComponent(interaction, env, ctx) {
   if (customId.startsWith(LoaCustomId.CONFIRM_CANCEL_PREFIX)) {
     const loaId = customId.slice(LoaCustomId.CONFIRM_CANCEL_PREFIX.length);
     try {
+      let targetLoa = null;
+      const curRes = await stub.fetch(
+        `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
+      );
+      const curData = await curRes.json().catch(() => ({}));
+      if (curData?.loa?.id === loaId) {
+        targetLoa = curData.loa;
+      }
+      if (!targetLoa && loaId) {
+        const getRes = await stub.fetch(`https://do/loa/get?id=${encodeURIComponent(loaId)}`);
+        const getData = await getRes.json().catch(() => ({}));
+        targetLoa = getData?.loa;
+      }
+
+      if (targetLoa) {
+        const isOwner = targetLoa.user_id === userId || targetLoa.ownerDiscordId === userId;
+        if (!isOwner && !canManageLOAs(interaction, env)) {
+          return ephemeralTextResponse("❌ Permission denied. You can only cancel your own LOA.");
+        }
+      }
+
       const cancelRes = await stub.fetch("https://do/loa/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ loaId, userId }),
+        body: JSON.stringify({ loaId, userId: targetLoa?.user_id || userId }),
       });
       const cancelData = await cancelRes.json();
       if (!cancelRes.ok || !cancelData.success) {
@@ -3360,17 +4022,28 @@ export async function handleLoaComponent(interaction, env, ctx) {
       const curRes = await stub.fetch(
         `https://do/loa/current?userId=${encodeURIComponent(userId)}&today=${encodeURIComponent(todayIso)}`
       );
-      const curData = await curRes.json();
+      const curData = await curRes.json().catch(() => ({}));
       let existing = curData?.loa;
 
       if (!existing && loaId) {
+        const getRes = await stub.fetch(`https://do/loa/get?id=${encodeURIComponent(loaId)}`);
+        const getData = await getRes.json().catch(() => ({}));
+        existing = getData?.loa;
+      }
+
+      if (!existing && loaId) {
         const histRes = await stub.fetch(`https://do/loa/history-all?limit=50`);
-        const histData = await histRes.json();
+        const histData = await histRes.json().catch(() => ({}));
         existing = histData?.history?.find((l) => l.id === loaId);
       }
 
       if (!existing) {
         return ephemeralTextResponse("❌ You do not currently have an active Leave of Absence.");
+      }
+
+      const isOwner = existing.user_id === userId || existing.ownerDiscordId === userId;
+      if (!isOwner && !canManageLOAs(interaction, env)) {
+        return ephemeralTextResponse("❌ Permission denied. You can only return early from your own LOA.");
       }
 
       if (existing.ended_early || existing.ended_at || existing.cancelled) {
@@ -3538,6 +4211,7 @@ export async function handleLoaModalSubmit(interaction, env, ctx) {
       env,
       todayIso,
       ctx,
+      interaction,
     });
   }
 
@@ -3554,6 +4228,7 @@ export async function handleLoaModalSubmit(interaction, env, ctx) {
       env,
       todayIso,
       ctx,
+      interaction,
     });
   }
 

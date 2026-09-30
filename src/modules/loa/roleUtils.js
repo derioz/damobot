@@ -15,7 +15,7 @@ import {
   DEFAULT_ROLE_MEMBER,
 } from "../../config/roles.js";
 import { loaConfig } from "../../config/loa.config.js";
-import { getGuildMember } from "./nicknameUtils.js";
+import { getGuildMember, modifyGuildMemberNickname } from "./nicknameUtils.js";
 
 /**
  * Default list of preserved player roles that are never snapshotted or removed during LOA.
@@ -1099,4 +1099,400 @@ export async function executeLoaRoleRestore({
     restoredRoleIds: successfullyRestored,
     failedRestoreRoleIds,
   };
+}
+
+/**
+ * Execute administrator role recovery for a staff member whose roles were incorrectly removed.
+ *
+ * Safeguards:
+ * 1. Confirm member still exists in Discord server.
+ * 2. Confirm each Role ID still exists in guild.
+ * 3. Confirm DamoBot has permission & hierarchy to assign the role.
+ * 4. Skip unmanageable / deleted roles (tracked with reason).
+ * 5. Do not fail entire recovery if one role could not be restored.
+ * 6. Do NOT remove unrelated roles user gained after going on LOA.
+ * 7. Remove temporary LOA roles.
+ * 8. Mark snapshot status and repair broken LOA record.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.targetUserId
+ * @param {Object} options.snapshot - Snapshot object with roleIds / role_ids
+ * @param {Object} [options.loaRecord] - Associated LOA record if available
+ * @param {string} options.adminUserId
+ * @param {Object} [options.stub] - StaffLoaDO stub
+ * @param {string} [options.staffLoaRoleId]
+ * @param {Object} [options.loaRoles]
+ * @param {Function} [options.customFetch=fetch]
+ * @returns {Promise<{
+ *   success: boolean,
+ *   error?: string,
+ *   restoredRoleIds: Array<string>,
+ *   skippedRoles: Array<{ roleId: string, roleName: string, reason: string }>,
+ *   loaRoleRemoved: boolean
+ * }>}
+ */
+export async function executeAdminRoleRestore({
+  env,
+  guildId,
+  targetUserId,
+  snapshot,
+  snapshotId = null,
+  loaRecord = null,
+  adminUserId,
+  stub = null,
+  staffLoaRoleId = env?.STAFF_LOA_ROLE_ID || loaConfig.staffLoaRoleId || DEFAULT_STAFF_LOA_ROLE_ID,
+  loaRoles = loaConfig.loaRoles || {},
+  customFetch = fetch,
+}) {
+  if (!targetUserId) {
+    return {
+      success: false,
+      error: "Missing targetUserId for role recovery",
+      restoredRoleIds: [],
+      skippedRoles: [],
+      loaRoleRemoved: false,
+    };
+  }
+
+  let activeSnapshot = snapshot;
+  if (!activeSnapshot && stub) {
+    if (snapshotId) {
+      try {
+        const snapRes = await stub.fetch(
+          `https://do/loa/role-snapshot/get?snapshotId=${encodeURIComponent(snapshotId)}`
+        );
+        const snapData = await snapRes.json().catch(() => ({}));
+        if (snapData?.snapshot) {
+          activeSnapshot = snapData.snapshot;
+        }
+      } catch (_) {}
+    }
+    if (!activeSnapshot && targetUserId) {
+      try {
+        const snapRes = await stub.fetch(
+          `https://do/loa/role-snapshot/latest?userId=${encodeURIComponent(targetUserId)}`
+        );
+        const snapData = await snapRes.json().catch(() => ({}));
+        if (snapData?.snapshot) {
+          activeSnapshot = snapData.snapshot;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Parse saved roles from snapshot
+  let savedRoleIds = [];
+  if (Array.isArray(activeSnapshot?.roleIds)) {
+    savedRoleIds = activeSnapshot.roleIds;
+  } else if (Array.isArray(activeSnapshot?.role_ids)) {
+    savedRoleIds = activeSnapshot.role_ids;
+  } else if (typeof activeSnapshot?.role_ids === "string") {
+    try {
+      savedRoleIds = JSON.parse(activeSnapshot.role_ids);
+    } catch (_) {
+      savedRoleIds = [];
+    }
+  } else if (loaRecord?.removedRoleIds?.length > 0) {
+    savedRoleIds = loaRecord.removedRoleIds;
+  } else if (typeof loaRecord?.removed_role_ids === "string") {
+    try {
+      savedRoleIds = JSON.parse(loaRecord.removed_role_ids);
+    } catch (_) {
+      savedRoleIds = [];
+    }
+  }
+
+  // 1. Confirm member still exists in Discord server
+  const memRes = await getGuildMember({ env, guildId, userId: targetUserId, customFetch });
+  if (!memRes.success || !memRes.member) {
+    return {
+      success: false,
+      error: `Member <@${targetUserId}> is no longer in the server. Roles cannot be restored.`,
+      restoredRoleIds: [],
+      skippedRoles: [],
+      loaRoleRemoved: false,
+    };
+  }
+  const currentMemberRoles = Array.isArray(memRes.member.roles) ? memRes.member.roles : [];
+
+  // 2. Fetch guild roles and bot hierarchy
+  const [rolesRes, botMemberRes] = await Promise.all([
+    getGuildRoles({ env, guildId, customFetch }),
+    getBotGuildMember({ env, guildId, customFetch }),
+  ]);
+  const roleMap = rolesRes.success && rolesRes.roleMap ? rolesRes.roleMap : new Map();
+  const botHighestPosition = botMemberRes.success
+    ? getBotHighestRolePosition(botMemberRes.member, roleMap)
+    : Infinity;
+
+  const validRolesToRestore = [];
+  const skippedRoles = [];
+
+  // Parse snapshot role names if present
+  let snapshotRoleNames = {};
+  if (activeSnapshot?.roleNames && typeof activeSnapshot.roleNames === "object") {
+    snapshotRoleNames = activeSnapshot.roleNames;
+  } else if (activeSnapshot?.role_names && typeof activeSnapshot.role_names === "object") {
+    snapshotRoleNames = activeSnapshot.role_names;
+  } else if (typeof activeSnapshot?.role_names === "string") {
+    try {
+      snapshotRoleNames = JSON.parse(activeSnapshot.role_names);
+    } catch (_) {}
+  }
+
+  // 3. Evaluate each saved role
+  for (const rawId of savedRoleIds) {
+    const roleId = String(rawId).trim();
+    if (!roleId || roleId === guildId) continue;
+
+    const roleObj = roleMap.get(roleId);
+    const recordedName = snapshotRoleNames[roleId] || roleObj?.name || `Role ${roleId}`;
+
+    if (!roleObj) {
+      // Role was deleted from the server
+      skippedRoles.push({
+        roleId,
+        roleName: recordedName,
+        reason: "Role no longer exists in server",
+      });
+      continue;
+    }
+
+    if (
+      botMemberRes.success &&
+      botHighestPosition > 0 &&
+      typeof roleObj.position === "number" &&
+      roleObj.position >= botHighestPosition
+    ) {
+      // Role is above bot in hierarchy
+      skippedRoles.push({
+        roleId,
+        roleName: roleObj.name,
+        reason: "Role position is above DamoBot in hierarchy",
+      });
+      continue;
+    }
+
+    if (isManagedRole(roleObj)) {
+      skippedRoles.push({
+        roleId,
+        roleName: roleObj.name,
+        reason: "Managed role cannot be manually assigned by bots",
+      });
+      continue;
+    }
+
+    validRolesToRestore.push(roleId);
+  }
+
+  // 4. Build set of LOA roles to remove
+  const loaRolesToRemove = new Set();
+  if (staffLoaRoleId) loaRolesToRemove.add(String(staffLoaRoleId).trim());
+  if (loaRoles?.moderator) loaRolesToRemove.add(String(loaRoles.moderator).trim());
+  if (loaRoles?.support) loaRolesToRemove.add(String(loaRoles.support).trim());
+  if (loaRecord?.assigned_loa_role_id) loaRolesToRemove.add(String(loaRecord.assigned_loa_role_id).trim());
+  if (loaRecord?.assignedLoaRoleId) loaRolesToRemove.add(String(loaRecord.assignedLoaRoleId).trim());
+  loaRolesToRemove.delete("");
+
+  // 5. Calculate target roles: KEEP all current roles user gained, remove LOA roles, add valid pre-LOA roles
+  const targetRolesSet = new Set(
+    currentMemberRoles.filter((r) => !loaRolesToRemove.has(String(r).trim()))
+  );
+  for (const rId of validRolesToRestore) {
+    targetRolesSet.add(rId);
+  }
+
+  // 6. Apply roles via atomic PATCH
+  const patchRes = await setGuildMemberRoles({
+    env,
+    guildId,
+    userId: targetUserId,
+    roles: Array.from(targetRolesSet),
+    reason: `Admin role recovery by ${adminUserId}`,
+    customFetch,
+  });
+
+  const successfullyRestored = [];
+  if (patchRes.success) {
+    successfullyRestored.push(...validRolesToRestore);
+  } else {
+    // Fallback: individually remove LOA roles, then add valid pre-LOA roles
+    for (const rId of loaRolesToRemove) {
+      await removeGuildMemberRole({
+        env,
+        guildId,
+        userId: targetUserId,
+        roleId: rId,
+        reason: "Admin role recovery: remove LOA role",
+        customFetch,
+      }).catch(() => {});
+    }
+    for (const rId of validRolesToRestore) {
+      const addRes = await addGuildMemberRole({
+        env,
+        guildId,
+        userId: targetUserId,
+        roleId: rId,
+        reason: "Admin role recovery: restore pre-LOA role",
+        customFetch,
+      });
+      if (addRes.success) {
+        successfullyRestored.push(rId);
+      } else {
+        const roleObj = roleMap.get(rId);
+        skippedRoles.push({
+          roleId: rId,
+          roleName: roleObj?.name || rId,
+          reason: addRes.error || "Discord API rejection",
+        });
+      }
+    }
+  }
+
+  // 7. Update snapshot in DO
+  if (stub && activeSnapshot?.id) {
+    await stub.fetch("https://do/loa/role-snapshot/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        snapshotId: activeSnapshot.id,
+        status: "RECOVERY_USED",
+        restoredBy: adminUserId,
+        restoreReason: "Manual Admin Recovery",
+        restoredAt: new Date().toISOString(),
+      }),
+    }).catch(() => {});
+  }
+
+  // 8. Repair/close associated LOA in DO if present
+  const targetLoaId = loaRecord?.id || activeSnapshot?.loaId || activeSnapshot?.loa_id;
+  if (stub && targetLoaId) {
+    await stub.fetch("https://do/loa/admin-recover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        loaId: targetLoaId,
+        userId: targetUserId,
+        restoredRoleIds: successfullyRestored,
+        failedRestoreRoleIds: skippedRoles.map((s) => s.roleId),
+        restoredBy: adminUserId,
+      }),
+    }).catch(() => {});
+  }
+
+  // 9. Revert nickname if modified
+  if (loaRecord?.nickname_modified && loaRecord?.original_nickname !== undefined) {
+    await modifyGuildMemberNickname({
+      env,
+      guildId,
+      userId: targetUserId,
+      newNickname: loaRecord.original_nickname,
+      reason: "Admin role recovery: restored nickname",
+      customFetch,
+    }).catch(() => {});
+  }
+
+  return {
+    success: true,
+    snapshot: activeSnapshot,
+    loaId: targetLoaId || null,
+    restoredRoleIds: successfullyRestored,
+    skippedRoles,
+    loaRoleRemoved: true,
+  };
+}
+
+/**
+ * Execute automatic rollback if role swap or subsequent LOA start steps fail.
+ * Reverts user back to their pre-LOA state and ensures no partial state remains.
+ *
+ * @param {Object} options
+ * @param {Object} options.env
+ * @param {string} options.guildId
+ * @param {string} options.userId
+ * @param {Array<string>} options.originalRoles
+ * @param {string|null} [options.assignedLoaRoleId]
+ * @param {string} [options.memberNick]
+ * @param {string} [options.originalError]
+ * @param {Object} [options.stub]
+ * @param {string} [options.loaId]
+ * @param {string} [options.snapshotId]
+ * @param {Function} [options.customFetch=fetch]
+ * @returns {Promise<{ success: boolean }>}
+ */
+export async function executeLoaRoleRollback({
+  env,
+  guildId,
+  userId,
+  originalRoles = [],
+  assignedLoaRoleId = null,
+  memberNick = null,
+  originalError = "Role change failed",
+  stub = null,
+  loaId = null,
+  snapshotId = null,
+  customFetch = fetch,
+}) {
+  // 1. Restore original roles
+  if (Array.isArray(originalRoles) && originalRoles.length > 0) {
+    await setGuildMemberRoles({
+      env,
+      guildId,
+      userId,
+      roles: originalRoles,
+      reason: "Staff LOA start failed: automatic rollback to original roles",
+      customFetch,
+    }).catch(() => {});
+  }
+
+  // 2. Remove LOA role if assigned
+  if (assignedLoaRoleId) {
+    await removeGuildMemberRole({
+      env,
+      guildId,
+      userId,
+      roleId: assignedLoaRoleId,
+      reason: "Staff LOA start failed: automatic rollback remove LOA role",
+      customFetch,
+    }).catch(() => {});
+  }
+
+  // 3. Revert nickname if changed
+  if (memberNick !== undefined) {
+    await modifyGuildMemberNickname({
+      env,
+      guildId,
+      userId,
+      newNickname: memberNick,
+      reason: "Staff LOA start failed: automatic rollback nickname",
+      customFetch,
+    }).catch(() => {});
+  }
+
+  // 4. Update snapshot status to ROLLED_BACK in DO
+  if (stub && snapshotId) {
+    await stub.fetch("https://do/loa/role-snapshot/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        snapshotId,
+        status: "ROLLED_BACK",
+        restoreReason: `Rollback: ${originalError}`,
+        restoredAt: new Date().toISOString(),
+      }),
+    }).catch(() => {});
+  }
+
+  // 5. Cancel LOA record in DO
+  if (stub && loaId) {
+    await stub.fetch("https://do/loa/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ loaId, userId }),
+    }).catch(() => {});
+  }
+
+  return { success: true };
 }

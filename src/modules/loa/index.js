@@ -35,6 +35,19 @@ export default defineModule({
           description: "Open or refresh the Staff LOA Center.",
           type: 1, // SUB_COMMAND
         },
+        {
+          name: "restore",
+          description: "Admin recovery to restore a staff member's pre-LOA roles.",
+          type: 1, // SUB_COMMAND
+          options: [
+            {
+              name: "user",
+              description: "The staff member whose roles to restore",
+              type: 6, // USER
+              required: true,
+            },
+          ],
+        },
       ],
     },
     {

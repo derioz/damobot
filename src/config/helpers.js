@@ -143,6 +143,28 @@ export function canManageLOAs(target, env = {}) {
 }
 
 /**
+ * Check if a user/member has administrative permission to manage all LOAs or recover staff roles.
+ * Restricted to Management, Owners, Administrators, and Superadmins.
+ *
+ * @param {Object} target Interaction or member
+ * @param {Object} [env={}]
+ * @returns {boolean}
+ */
+export function canAdministerLOAs(target, env = {}) {
+  if (isSuperadmin(target)) return true;
+
+  const allowedRoles = [
+    ...(loaConfig.roles?.managers || []),
+    ...(loaConfig.protectedRoleIds || []),
+  ];
+
+  if (env.VRP_MANAGEMENT_ROLE_ID) allowedRoles.push(env.VRP_MANAGEMENT_ROLE_ID);
+  if (env.OWNER_ROLE_ID) allowedRoles.push(env.OWNER_ROLE_ID);
+
+  return hasAnyRole(target, allowedRoles);
+}
+
+/**
  * Check if a user/member currently has the Staff LOA role.
  *
  * @param {Object} target Interaction, member, or role array
