@@ -108,3 +108,47 @@ test("API ROUTER: GET /api/audit-log retrieves logged configuration modification
   assert.ok(Array.isArray(logs));
   assert.ok(logs.some((l) => l.moduleId === "refunds" && l.key === "categories"));
 });
+
+test("API ROUTER: POST /api/modules/:id/disable and enable toggles module live", async () => {
+  // Disable module
+  const disableReq = new Request("https://worker.test/api/modules/refunds/disable", {
+    method: "POST",
+  });
+  const disableRes = await DamoBotCore.handleFetch(disableReq, {}, {});
+  assert.equal(disableRes.status, 200);
+  const disableData = await disableRes.json();
+  assert.equal(disableData.enabled, false);
+  assert.equal(disableData.liveSynced, true);
+
+  // Check GET /api/modules shows disabled
+  const getReq = new Request("https://worker.test/api/modules", { method: "GET" });
+  const getRes = await DamoBotCore.handleFetch(getReq, {}, {});
+  const list = await getRes.json();
+  const refundsMod = list.find((m) => m.id === "refunds");
+  assert.equal(refundsMod.enabled, false);
+
+  // Re-enable module
+  const enableReq = new Request("https://worker.test/api/modules/refunds/enable", {
+    method: "POST",
+  });
+  const enableRes = await DamoBotCore.handleFetch(enableReq, {}, {});
+  assert.equal(enableRes.status, 200);
+  const enableData = await enableRes.json();
+  assert.equal(enableData.enabled, true);
+});
+
+test("API ROUTER: PUT /api/modules/:id saves general settings live with audit record", async () => {
+  const req = new Request("https://worker.test/api/modules/suggestions", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customSetting: "testValue", enabled: true }),
+  });
+
+  const res = await DamoBotCore.handleFetch(req, {}, {});
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.equal(data.success, true);
+  assert.equal(data.liveSynced, true);
+  assert.equal(data.updated.customSetting, "testValue");
+});
+

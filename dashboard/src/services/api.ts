@@ -136,7 +136,9 @@ export const api = {
       credentials: "include",
     });
     if (!res.ok) throw new Error("Failed to toggle module");
-    return res.json();
+    const data = await res.json();
+    const refreshed = await this.getModule(id);
+    return refreshed || { ...data, enabled };
   },
 
   async updateModuleSettings(id: ModuleId, settings: Record<string, any>): Promise<ModuleDefinition> {
@@ -174,7 +176,9 @@ export const api = {
       credentials: "include",
     });
     if (!res.ok) throw new Error("Failed to update module settings");
-    return res.json();
+    const data = await res.json();
+    const refreshed = await this.getModule(id);
+    return refreshed || data;
   },
 
   // Discord Resources

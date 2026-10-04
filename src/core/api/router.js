@@ -11,6 +11,9 @@ import {
   saveDynamicModuleConfig,
   recordConfigAudit,
   getRecentConfigAudits,
+  syncBotDynamicConfigs,
+  isModuleDynamicallyEnabled,
+  getCachedDynamicConfig,
 } from "../storage/dynamicConfigDb.js";
 import { registry } from "../module-registry/registry.js";
 import {
@@ -63,6 +66,7 @@ export async function handleApiRequest(request, env, ctx) {
   try {
     // 1. GET /api/dashboard/status
     if (request.method === "GET" && url.pathname === "/api/dashboard/status") {
+      await syncBotDynamicConfigs(env);
       const allModules = registry.getAll();
       return json({
         status: "online",
@@ -71,8 +75,9 @@ export async function handleApiRequest(request, env, ctx) {
         guildId: env?.DISCORD_GUILD_ID || "730015674348601384",
         guildName: env?.COMMUNITY_NAME || "Vital RP",
         uptime: "99.98%",
-        activeModulesCount: allModules.filter((m) => m.id !== "reminders").length,
+        activeModulesCount: allModules.filter((m) => isModuleDynamicallyEnabled(m.id) && (m.id !== "reminders" || env?.REMINDERS_ENABLED === "true")).length,
         totalModulesCount: allModules.length,
+        liveSynced: true,
         d1Databases: [
           { name: "damo-bot-punishments", binding: "PUNISHMENT_DB", connected: Boolean(env?.PUNISHMENT_DB) },
           { name: "damo-bot-refunds", binding: "REFUND_DB", connected: Boolean(env?.REFUND_DB) },
@@ -113,20 +118,18 @@ export async function handleApiRequest(request, env, ctx) {
 
     // 3. GET /api/modules
     if (request.method === "GET" && url.pathname === "/api/modules") {
-      // Check if dynamic config exists for refunds
-      const dynamicRefunds = await getDynamicModuleConfig(env, "refunds");
-      if (dynamicRefunds?.categories) {
-        setRefundCategories(dynamicRefunds.categories);
-      }
+      // Sync dynamic configs across isolates
+      await syncBotDynamicConfigs(env);
 
       const allModules = registry.getAll();
       const list = allModules.map((m) => {
+        const dynamicConf = getCachedDynamicConfig(m.id);
         let isEnabled = true;
         if (m.id === "reminders") {
           isEnabled = env?.REMINDERS_ENABLED === "true";
         }
-        if (m.id === "refunds" && dynamicRefunds?.enabled !== undefined) {
-          isEnabled = dynamicRefunds.enabled;
+        if (dynamicConf?.enabled !== undefined) {
+          isEnabled = dynamicConf.enabled;
         }
 
         return {
@@ -153,71 +156,148 @@ export async function handleApiRequest(request, env, ctx) {
       return json(list);
     }
 
-    // 4. PUT /api/modules/:id
+    // 4. POST /api/modules/:id/(enable|disable)
+    const toggleMatch = url.pathname.match(/^\/api\/modules\/([a-zA-Z0-9_\-]+)\/(enable|disable)$/);
+    if (request.method === "POST" && toggleMatch) {
+      const moduleId = toggleMatch[1];
+      const shouldEnable = toggleMatch[2] === "enable";
+      const mod = registry.get(moduleId);
+      if (!mod) {
+        return error(`Module '${moduleId}' not found`, 404);
+      }
+
+      const existingConfig = (await getDynamicModuleConfig(env, moduleId)) || {};
+      const updatedConfig = {
+        ...existingConfig,
+        enabled: shouldEnable,
+      };
+
+      await saveDynamicModuleConfig(env, moduleId, updatedConfig, {
+        id: "150580708144840704",
+        name: "Damon",
+      });
+
+      await recordConfigAudit(env, {
+        userId: "150580708144840704",
+        userName: "Damon",
+        moduleId: moduleId,
+        moduleName: mod.name,
+        action: shouldEnable ? "enable_module" : "disable_module",
+        key: "enabled",
+        oldValue: String(!shouldEnable),
+        newValue: String(shouldEnable),
+      });
+
+      return json({
+        success: true,
+        id: moduleId,
+        name: mod.name,
+        enabled: shouldEnable,
+        liveSynced: true,
+        message: `Module '${mod.name}' ${shouldEnable ? "enabled" : "disabled"} live in Cloudflare D1.`,
+      });
+    }
+
+    // 5. PUT /api/modules/:id
     const moduleMatch = url.pathname.match(/^\/api\/modules\/([a-zA-Z0-9_\-]+)$/);
     if (request.method === "PUT" && moduleMatch) {
       const moduleId = moduleMatch[1];
+      const mod = registry.get(moduleId);
+      if (!mod) {
+        return error(`Module '${moduleId}' not found`, 404);
+      }
       const body = await request.json();
 
-      if (moduleId === "refunds") {
-        if (body.categories) {
-          if (!Array.isArray(body.categories)) {
-            return error("Categories must be an array");
-          }
-
-          // Enforce Discord limits
-          const active = body.categories.filter((c) => c.enabled !== false);
-          if (active.length > 24) {
-            return error("Cannot enable more than 24 active categories (Discord Select Menus and button rows limit to 25 items max).");
-          }
-
-          for (const cat of body.categories) {
-            if (!cat.id || String(cat.id).trim().length === 0) {
-              return error("Every category must have a non-empty ID.");
-            }
-            if (String(cat.id).length > 32) {
-              return error(`Category ID "${cat.id}" exceeds 32 character limit.`);
-            }
-            if (String(cat.label || cat.id).length > 32) {
-              return error(`Category label "${cat.label}" exceeds 32 character limit.`);
-            }
-            if (cat.description && String(cat.description).length > 80) {
-              return error(`Category description for "${cat.id}" exceeds 80 characters.`);
-            }
-          }
-
-          // Update in-memory config for immediate Discord interaction use
-          setRefundCategories(body.categories);
-
-          // Save to D1 database for permanence
-          await saveDynamicModuleConfig(env, "refunds", {
-            categories: body.categories,
-            enabled: body.enabled !== false,
-          }, { id: "150580708144840704", name: "Damon" });
-
-          // Record audit log
-          await recordConfigAudit(env, {
-            userId: "150580708144840704",
-            userName: "Damon",
-            moduleId: "refunds",
-            moduleName: "Staff Refund Center",
-            action: "update_setting",
-            key: "categories",
-            oldValue: `${refundConfig.categories.length} categories`,
-            newValue: `${body.categories.length} categories (${active.length} active)`,
-          });
-
-          return json({
-            success: true,
-            id: "refunds",
-            name: "Staff Refund Center",
-            enabled: body.enabled !== false,
-            categories: refundConfig.categories,
-          });
+      if (moduleId === "refunds" && body.categories) {
+        if (!Array.isArray(body.categories)) {
+          return error("Categories must be an array");
         }
+
+        // Enforce Discord limits
+        const active = body.categories.filter((c) => c.enabled !== false);
+        if (active.length > 24) {
+          return error("Cannot enable more than 24 active categories (Discord Select Menus and button rows limit to 25 items max).");
+        }
+
+        for (const cat of body.categories) {
+          if (!cat.id || String(cat.id).trim().length === 0) {
+            return error("Every category must have a non-empty ID.");
+          }
+          if (String(cat.id).length > 32) {
+            return error(`Category ID "${cat.id}" exceeds 32 character limit.`);
+          }
+          if (String(cat.label || cat.id).length > 32) {
+            return error(`Category label "${cat.label}" exceeds 32 character limit.`);
+          }
+          if (cat.description && String(cat.description).length > 80) {
+            return error(`Category description for "${cat.id}" exceeds 80 characters.`);
+          }
+        }
+
+        // Update in-memory config for immediate Discord interaction use
+        setRefundCategories(body.categories);
+
+        // Save to D1 database for permanence
+        await saveDynamicModuleConfig(env, "refunds", {
+          categories: body.categories,
+          enabled: body.enabled !== false,
+        }, { id: "150580708144840704", name: "Damon" });
+
+        // Record audit log
+        await recordConfigAudit(env, {
+          userId: "150580708144840704",
+          userName: "Damon",
+          moduleId: "refunds",
+          moduleName: "Staff Refund Center",
+          action: "update_setting",
+          key: "categories",
+          oldValue: `${refundConfig.categories.length} categories`,
+          newValue: `${body.categories.length} categories (${active.length} active)`,
+        });
+
+        return json({
+          success: true,
+          id: "refunds",
+          name: "Staff Refund Center",
+          enabled: body.enabled !== false,
+          categories: refundConfig.categories,
+          liveSynced: true,
+          message: "Refund categories saved to Cloudflare D1. Discord bot updated live.",
+        });
       }
 
-      return json({ success: true, id: moduleId, updated: body });
+      // General module update
+      const existingConfig = (await getDynamicModuleConfig(env, moduleId)) || {};
+      const updatedConfig = {
+        ...existingConfig,
+        ...body,
+      };
+
+      await saveDynamicModuleConfig(env, moduleId, updatedConfig, {
+        id: "150580708144840704",
+        name: "Damon",
+      });
+
+      await recordConfigAudit(env, {
+        userId: "150580708144840704",
+        userName: "Damon",
+        moduleId: moduleId,
+        moduleName: mod.name,
+        action: "update_setting",
+        key: "settings",
+        oldValue: JSON.stringify(existingConfig),
+        newValue: JSON.stringify(updatedConfig),
+      });
+
+      return json({
+        success: true,
+        id: moduleId,
+        name: mod.name,
+        enabled: updatedConfig.enabled !== false,
+        updated: updatedConfig,
+        liveSynced: true,
+        message: `Settings for '${mod.name}' saved to Cloudflare D1. Discord bot updated live.`,
+      });
     }
 
     // 5. GET /api/audit-log

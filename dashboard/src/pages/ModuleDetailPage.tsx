@@ -158,9 +158,19 @@ export const ModuleDetailPage: React.FC<ModuleDetailPageProps> = ({
 
       {/* Save Success Alert */}
       {saveSuccess && (
-        <div className="p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 flex items-center gap-3 text-sm animate-fade-in">
-          <CheckCircle2 className="w-5 h-5 flex-shrink-0" />
-          <span>Configuration saved successfully and updated live.</span>
+        <div className="p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-sm animate-fade-in shadow-lg shadow-emerald-950/20">
+          <div className="flex items-center gap-3">
+            <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-emerald-400" />
+            <div>
+              <div className="font-semibold text-emerald-300">Live Bot Updated Instantly!</div>
+              <div className="text-xs text-emerald-400/80">
+                Changes saved to Cloudflare D1. The Discord bot reflects this live at runtime without redeploying.
+              </div>
+            </div>
+          </div>
+          <Badge variant="success" className="text-[10px] font-mono self-start sm:self-center">
+            Live Synced
+          </Badge>
         </div>
       )}
 

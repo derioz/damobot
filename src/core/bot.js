@@ -11,6 +11,7 @@ import { validateBotConfig, validateEnvironment } from "../config/validate.js";
 import { DAMO_BOT_VERSION } from "../config.js";
 import { handleAdminChatMessage } from "../modules/admin-chat/mentionHandler.js";
 import { handleApiRequest } from "./api/router.js";
+import { syncBotDynamicConfigs } from "./storage/dynamicConfigDb.js";
 
 // Validate bot configuration on startup
 validateBotConfig();
@@ -31,6 +32,7 @@ export const DamoBotCore = {
    */
   async handleScheduled(event, env, ctx) {
     ensureEnvironmentValidated(env);
+    await syncBotDynamicConfigs(env);
     const tasks = registry.getScheduledTasks();
     const promises = tasks.map(({ module: mod, scheduled }) =>
       (async () => {
@@ -122,6 +124,9 @@ export const DamoBotCore = {
       } catch {
         return new Response("Invalid request body", { status: 400 });
       }
+
+      // Sync latest dynamic configs from D1 (e.g. categories, enabled states)
+      await syncBotDynamicConfigs(env);
 
       return await dispatchInteraction(interaction, env, ctx);
     }

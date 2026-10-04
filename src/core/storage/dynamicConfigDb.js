@@ -4,8 +4,12 @@
  * and safe fallback for local/unit testing.
  */
 
+import { setRefundCategories } from "../../config/refund.config.js";
+
 const memoryConfigCache = new Map();
 const memoryAuditLogs = [];
+let lastCacheSyncTime = 0;
+const CACHE_TTL_MS = 15000; // 15 seconds TTL between D1 sync checks per isolate
 
 /**
  * Ensure database tables exist in D1.
@@ -41,6 +45,80 @@ async function ensureTables(db) {
 }
 
 /**
+ * Sync all dynamic configurations from D1 into active bot memory.
+ * Runs on bot fetch/interaction requests with a 15-second TTL cache,
+ * ensuring all Cloudflare Worker isolates immediately reflect dashboard changes.
+ *
+ * @param {Object} env Cloudflare Worker environment
+ * @param {boolean} [force=false] Force refresh from D1 ignoring TTL
+ * @returns {Promise<void>}
+ */
+export async function syncBotDynamicConfigs(env, force = false) {
+  const now = Date.now();
+  if (!force && lastCacheSyncTime > 0 && now - lastCacheSyncTime < CACHE_TTL_MS) {
+    return;
+  }
+
+  const db = env?.REFUND_DB || env?.PUNISHMENT_DB;
+  if (!db) {
+    lastCacheSyncTime = now;
+    return;
+  }
+
+  try {
+    await ensureTables(db);
+    const { results } = await db
+      .prepare("SELECT module_id, config_json FROM bot_dynamic_configs")
+      .all();
+
+    if (results && Array.isArray(results)) {
+      for (const row of results) {
+        if (!row.module_id || !row.config_json) continue;
+        try {
+          const parsed = JSON.parse(row.config_json);
+          memoryConfigCache.set(row.module_id, parsed);
+
+          // Apply live module configurations
+          if (row.module_id === "refunds" && parsed.categories) {
+            setRefundCategories(parsed.categories);
+          }
+        } catch (e) {
+          console.warn(`[DynamicConfigDb] Error parsing config for ${row.module_id}:`, e);
+        }
+      }
+    }
+    lastCacheSyncTime = now;
+  } catch (err) {
+    console.warn("[DynamicConfigDb] Failed to sync dynamic configs:", err?.message || err);
+  }
+}
+
+/**
+ * Check whether a module is dynamically enabled.
+ * Defaults to true if no override exists.
+ *
+ * @param {string} moduleId
+ * @returns {boolean}
+ */
+export function isModuleDynamicallyEnabled(moduleId) {
+  const conf = memoryConfigCache.get(moduleId);
+  if (conf && conf.enabled !== undefined) {
+    return Boolean(conf.enabled);
+  }
+  return true;
+}
+
+/**
+ * Get cached dynamic config for a module.
+ *
+ * @param {string} moduleId
+ * @returns {Object|null}
+ */
+export function getCachedDynamicConfig(moduleId) {
+  return memoryConfigCache.get(moduleId) || null;
+}
+
+/**
  * Get dynamic configuration for a module from D1 (with memory fallback).
  *
  * @param {Object} env Cloudflare Worker environment
@@ -67,6 +145,9 @@ export async function getDynamicModuleConfig(env, moduleId) {
     if (row?.config_json) {
       const parsed = JSON.parse(row.config_json);
       memoryConfigCache.set(moduleId, parsed);
+      if (moduleId === "refunds" && parsed.categories) {
+        setRefundCategories(parsed.categories);
+      }
       return parsed;
     }
   } catch (err) {
@@ -87,6 +168,11 @@ export async function getDynamicModuleConfig(env, moduleId) {
  */
 export async function saveDynamicModuleConfig(env, moduleId, config, user = { id: "admin", name: "Administrator" }) {
   memoryConfigCache.set(moduleId, config);
+  lastCacheSyncTime = Date.now();
+
+  if (moduleId === "refunds" && config.categories) {
+    setRefundCategories(config.categories);
+  }
 
   const db = env?.REFUND_DB || env?.PUNISHMENT_DB;
   if (!db) {

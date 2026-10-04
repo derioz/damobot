@@ -6,6 +6,7 @@
 import { InteractionType } from "discord-interactions";
 import { pongResponse, ephemeralTextResponse } from "../../shared/discord.js";
 import { registry } from "../module-registry/index.js";
+import { isModuleDynamicallyEnabled } from "../storage/dynamicConfigDb.js";
 
 /**
  * Dispatch an incoming verified Discord interaction.
@@ -28,6 +29,11 @@ export async function dispatchInteraction(interaction, env, ctx) {
       const match = registry.findCommandHandler(commandName);
 
       if (match && typeof match.handler === "function") {
+        if (match.module?.id && !isModuleDynamicallyEnabled(match.module.id)) {
+          return ephemeralTextResponse(
+            `⚠️ **The \`${match.module.name || match.module.id}\` module is currently disabled by an administrator in the web dashboard.**`
+          );
+        }
         return await match.handler(interaction, env, ctx);
       }
 
@@ -43,6 +49,11 @@ export async function dispatchInteraction(interaction, env, ctx) {
       const match = registry.findComponentHandler(customId);
 
       if (match && typeof match.handler === "function") {
+        if (match.module?.id && !isModuleDynamicallyEnabled(match.module.id)) {
+          return ephemeralTextResponse(
+            `⚠️ **The \`${match.module.name || match.module.id}\` module is currently disabled by an administrator in the web dashboard.**`
+          );
+        }
         return await match.handler(interaction, env, ctx);
       }
 
@@ -60,6 +71,11 @@ export async function dispatchInteraction(interaction, env, ctx) {
       const match = registry.findModalHandler(customId);
 
       if (match && typeof match.handler === "function") {
+        if (match.module?.id && !isModuleDynamicallyEnabled(match.module.id)) {
+          return ephemeralTextResponse(
+            `⚠️ **The \`${match.module.name || match.module.id}\` module is currently disabled by an administrator in the web dashboard.**`
+          );
+        }
         return await match.handler(interaction, env, ctx);
       }
 
