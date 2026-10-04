@@ -196,3 +196,15 @@ export const REFUND_CATEGORY_OPTIONS = new Proxy([], {
   },
 });
 
+/**
+ * Set the refund categories dynamically (from D1 or Dashboard API).
+ *
+ * @param {Array<Object>} newCategories
+ */
+export function setRefundCategories(newCategories) {
+  if (Array.isArray(newCategories) && newCategories.length > 0) {
+    refundConfig.categories = newCategories;
+  }
+}
+
+

@@ -14,6 +14,7 @@ import { Badge } from "../components/ui/Badge";
 import { RoleSelector } from "../components/discord/RoleSelector";
 import { ChannelSelector } from "../components/discord/ChannelSelector";
 import { ConfirmModal } from "../components/ui/ConfirmModal";
+import { CategoryManager } from "../components/modules/CategoryManager";
 import { ModuleDefinition, ModuleId } from "../types/modules";
 import { DiscordRole, DiscordChannel } from "../types/discord";
 
@@ -306,39 +307,12 @@ export const ModuleDetailPage: React.FC<ModuleDetailPageProps> = ({
                   {(field.type === "categories_refund" ||
                     field.type === "categories_suggestion") &&
                     Array.isArray(currentValue) && (
-                      <div className="pt-4 border-t border-dark-750/70 space-y-3">
-                        <div className="text-xs font-semibold text-slate-300">
-                          Active Categories ({currentValue.length})
-                        </div>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                          {currentValue.map((cat: any, idx: number) => (
-                            <div
-                              key={cat.id || idx}
-                              className="p-3 rounded-lg bg-dark-900 border border-dark-750 space-y-2"
-                            >
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-lg">{cat.emoji}</span>
-                                  <span className="font-semibold text-xs text-slate-200">
-                                    {cat.label || cat.id}
-                                  </span>
-                                </div>
-                                <ToggleSwitch
-                                  size="sm"
-                                  checked={cat.enabled !== false}
-                                  onChange={(enabled) => {
-                                    const copy = [...currentValue];
-                                    copy[idx] = { ...copy[idx], enabled };
-                                    handleFieldChange(field.key, copy);
-                                  }}
-                                />
-                              </div>
-                              <p className="text-[11px] text-slate-400 line-clamp-1">
-                                {cat.description || "No description provided"}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
+                      <div className="pt-4 border-t border-dark-750/70">
+                        <CategoryManager
+                          categories={currentValue}
+                          onChange={(cats) => handleFieldChange(field.key, cats)}
+                          maxActiveCategories={24}
+                        />
                       </div>
                     )}
                 </SpotlightCard>

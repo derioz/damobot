@@ -92,7 +92,18 @@ Whenever you are asked to **create a module**, **add a module**, **build a new D
 - **Planned Staff Activity Tracker**: Read `STAFF_ACTIVITY_PLAN.md` before continuing this feature. It records the agreed support/refund-only scope, verified Discord IDs, attribution rules, and remaining work. The tracker is not implemented; saving the plan did not authorize overnight work or deployment.
 
 - **Platform**: Cloudflare Workers + SQLite Durable Objects (`StickyBotDO` & `StaffLoaDO`).
-- **Discord UI**: Components V2 (`Container`, `Section`, `TextDisplay`, `Thumbnail`, `Separator`, `ActionRow`, `Button`).
-- **Branding**: Vital RP logo (`VITAL_RP_LOGO_URL` in `src/config.js`) via header/author icon and native embed footer icon.
 - **Module Architecture**: Documented in `docs/MODULES.md`.
+
+## DamoBot Dashboard React Bits Design Directive
+
+Whenever making changes to, styling, or adding new features/components to the DamoBot web dashboard (`dashboard/`):
+- **Always use React Bits**: Integrate animations, micro-interactions, components, and effects inspired by or adapted from [React Bits](https://github.com/DavidHDev/react-bits.git).
+- **Be Creative with Component Choices**:
+  - **Cards & Surfaces**: `SpotlightCard` (mouse-following glow), `BorderGlow` (animated gradient borders), `TiltedCard` (3D perspective tilt), `PixelCard` (technical reveal).
+  - **Text & Headers**: `BlurText` (smooth blur-to-sharp entrance), `DecryptedText` / `ScrambleText` (cyberpunk decoding for IDs/versions), `ShinyText` (shimmer sweep), `CountUp` (number transitions).
+  - **Navigation & Lists**: `FluidTabs` (sliding pill indicator), `AnimatedList` (staggered spring entrance for lists/audits), `Dock` (spring-physics magnification).
+  - **Micro-Interactions**: `MagneticButton` (magnetic cursor pull), `ElasticSlider` (spring sliders for numbers), smooth `ToggleSwitch`.
+  - **Backgrounds**: Subtle animated dark mesh grids and ambient particles matching `#08090D` and `#0E1017`.
+- **Maintain Usability & Performance**: Keep animations sleek and purposeful for a fast, responsive admin dashboard without cluttering forms or inputs. Always respect `prefers-reduced-motion`.
+
 

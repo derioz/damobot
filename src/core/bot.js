@@ -10,6 +10,7 @@ import { registry } from "./module-registry/index.js";
 import { validateBotConfig, validateEnvironment } from "../config/validate.js";
 import { DAMO_BOT_VERSION } from "../config.js";
 import { handleAdminChatMessage } from "../modules/admin-chat/mentionHandler.js";
+import { handleApiRequest } from "./api/router.js";
 
 // Validate bot configuration on startup
 validateBotConfig();
@@ -53,6 +54,11 @@ export const DamoBotCore = {
   async handleFetch(request, env, ctx) {
     ensureEnvironmentValidated(env);
     const url = new URL(request.url);
+ 
+    // Dedicated API endpoint for Web Dashboard
+    if (url.pathname.startsWith("/api/")) {
+      return handleApiRequest(request, env, ctx);
+    }
 
     // Dedicated JSON health check endpoint with environment validation
     if (request.method === "GET" && url.pathname === "/health") {
