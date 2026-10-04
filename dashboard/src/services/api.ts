@@ -63,7 +63,7 @@ export const api = {
     if (!API_BASE) {
       return MOCK_CURRENT_USER;
     }
-    const res = await fetch(`${API_BASE}/api/auth/me`, { credentials: "include" });
+    const res = await fetch(`${API_BASE}/api/auth/me`);
     if (!res.ok) throw new Error("Unauthorized");
     return res.json();
   },
@@ -75,7 +75,6 @@ export const api = {
     }
     await fetch(`${API_BASE}/api/auth/logout`, {
       method: "POST",
-      credentials: "include",
     });
   },
 
@@ -90,9 +89,7 @@ export const api = {
         totalModulesCount: modules.length,
       };
     }
-    const res = await fetch(`${API_BASE}/api/dashboard/status`, {
-      credentials: "include",
-    });
+    const res = await fetch(`${API_BASE}/api/dashboard/status`);
     if (!res.ok) throw new Error("Failed to fetch bot status");
     return res.json();
   },
@@ -102,7 +99,7 @@ export const api = {
     if (!API_BASE) {
       return getStoredModules();
     }
-    const res = await fetch(`${API_BASE}/api/modules`, { credentials: "include" });
+    const res = await fetch(`${API_BASE}/api/modules`);
     if (!res.ok) throw new Error("Failed to fetch modules");
     return res.json();
   },
@@ -133,7 +130,6 @@ export const api = {
     }
     const res = await fetch(`${API_BASE}/api/modules/${id}/${enabled ? "enable" : "disable"}`, {
       method: "POST",
-      credentials: "include",
     });
     if (!res.ok) throw new Error("Failed to toggle module");
     const data = await res.json();
@@ -173,7 +169,6 @@ export const api = {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(settings),
-      credentials: "include",
     });
     if (!res.ok) throw new Error("Failed to update module settings");
     const data = await res.json();
@@ -186,9 +181,7 @@ export const api = {
     if (!API_BASE) {
       return MOCK_DISCORD_ROLES;
     }
-    const res = await fetch(`${API_BASE}/api/discord/roles`, {
-      credentials: "include",
-    });
+    const res = await fetch(`${API_BASE}/api/discord/roles`);
     if (!res.ok) throw new Error("Failed to fetch Discord roles");
     return res.json();
   },
@@ -197,9 +190,7 @@ export const api = {
     if (!API_BASE) {
       return MOCK_DISCORD_CHANNELS;
     }
-    const res = await fetch(`${API_BASE}/api/discord/channels`, {
-      credentials: "include",
-    });
+    const res = await fetch(`${API_BASE}/api/discord/channels`);
     if (!res.ok) throw new Error("Failed to fetch Discord channels");
     return res.json();
   },
@@ -209,7 +200,7 @@ export const api = {
     if (!API_BASE) {
       return getStoredAuditLogs();
     }
-    const res = await fetch(`${API_BASE}/api/audit-log`, { credentials: "include" });
+    const res = await fetch(`${API_BASE}/api/audit-log`);
     if (!res.ok) throw new Error("Failed to fetch audit log");
     return res.json();
   },

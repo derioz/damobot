@@ -27,13 +27,13 @@ export const App: React.FC = () => {
     async function loadInitialData() {
       try {
         const [
-          currentUser,
-          modList,
-          rolesList,
-          channelsList,
-          statusData,
-          logsData,
-        ] = await Promise.all([
+          userRes,
+          modulesRes,
+          rolesRes,
+          channelsRes,
+          statusRes,
+          logsRes,
+        ] = await Promise.allSettled([
           api.getCurrentUser(),
           api.getModules(),
           api.getDiscordRoles(),
@@ -42,14 +42,26 @@ export const App: React.FC = () => {
           api.getAuditLogs(),
         ]);
 
-        setUser(currentUser);
-        setModules(modList);
-        setDiscordRoles(rolesList);
-        setDiscordChannels(channelsList);
-        setBotStatus(statusData);
-        setAuditLogs(logsData);
+        if (userRes.status === "fulfilled" && userRes.value) {
+          setUser(userRes.value);
+        }
+        if (modulesRes.status === "fulfilled" && modulesRes.value) {
+          setModules(modulesRes.value);
+        }
+        if (rolesRes.status === "fulfilled" && rolesRes.value) {
+          setDiscordRoles(rolesRes.value);
+        }
+        if (channelsRes.status === "fulfilled" && channelsRes.value) {
+          setDiscordChannels(channelsRes.value);
+        }
+        if (statusRes.status === "fulfilled" && statusRes.value) {
+          setBotStatus(statusRes.value);
+        }
+        if (logsRes.status === "fulfilled" && logsRes.value) {
+          setAuditLogs(logsRes.value);
+        }
       } catch (err) {
-        console.warn("API offline or unauthenticated, falling back to mock mode", err);
+        console.warn("Failed loading live bot data", err);
       } finally {
         setLoading(false);
       }

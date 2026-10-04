@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Plus, Edit2, Trash2, AlertCircle, X } from "lucide-react";
+import { Plus, Edit2, Trash2, AlertCircle, X, Save } from "lucide-react";
 import { Button } from "../ui/Button";
 import { ToggleSwitch } from "../ui/ToggleSwitch";
 import { Badge } from "../ui/Badge";
@@ -16,6 +16,9 @@ export interface RefundCategoryItem {
 interface CategoryManagerProps {
   categories: RefundCategoryItem[];
   onChange: (categories: RefundCategoryItem[]) => void;
+  onSave?: (categories: RefundCategoryItem[]) => Promise<void>;
+  isSaving?: boolean;
+  hasUnsavedChanges?: boolean;
   maxActiveCategories?: number;
 }
 
@@ -24,6 +27,9 @@ const QUICK_EMOJIS = ["🪙", "💵", "💎", "📦", "🚗", "🔫", "🏠", "�
 export const CategoryManager: React.FC<CategoryManagerProps> = ({
   categories,
   onChange,
+  onSave,
+  isSaving = false,
+  hasUnsavedChanges = false,
   maxActiveCategories = 24, // 24 active + 1 "All" button = 25 Discord limit
 }) => {
   const [modalMode, setModalMode] = useState<"add" | "edit" | null>(null);
@@ -128,12 +134,17 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
       enabled: formEnabled,
     };
 
+    let updated: RefundCategoryItem[] = [];
     if (modalMode === "add") {
-      onChange([...categories, newCategory]);
+      updated = [...categories, newCategory];
     } else if (modalMode === "edit" && editIndex !== null) {
-      const copy = [...categories];
-      copy[editIndex] = newCategory;
-      onChange(copy);
+      updated = [...categories];
+      updated[editIndex] = newCategory;
+    }
+
+    onChange(updated);
+    if (onSave) {
+      onSave(updated);
     }
 
     setModalMode(null);
@@ -144,6 +155,9 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
       const copy = [...categories];
       copy.splice(deleteConfirm.index, 1);
       onChange(copy);
+      if (onSave) {
+        onSave(copy);
+      }
     }
     setDeleteConfirm({ isOpen: false, index: null, category: null });
   };
@@ -156,6 +170,9 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
     const copy = [...categories];
     copy[index] = { ...copy[index], enabled };
     onChange(copy);
+    if (onSave) {
+      onSave(copy);
+    }
   };
 
   return (
@@ -176,14 +193,27 @@ export const CategoryManager: React.FC<CategoryManagerProps> = ({
           </p>
         </div>
 
-        <Button
-          variant="primary"
-          size="sm"
-          icon={<Plus className="w-3.5 h-3.5" />}
-          onClick={openAddModal}
-        >
-          Add Category
-        </Button>
+        <div className="flex items-center gap-2 self-start sm:self-center">
+          {hasUnsavedChanges && onSave && (
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={isSaving}
+              icon={<Save className="w-3.5 h-3.5 text-brand-orange" />}
+              onClick={() => onSave(categories)}
+            >
+              Save to Discord
+            </Button>
+          )}
+          <Button
+            variant="primary"
+            size="sm"
+            icon={<Plus className="w-3.5 h-3.5" />}
+            onClick={openAddModal}
+          >
+            Add Category
+          </Button>
+        </div>
       </div>
 
       {/* Categories Cards Grid */}

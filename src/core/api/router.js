@@ -147,7 +147,7 @@ export async function handleApiRequest(request, env, ctx) {
               label: "Refund Categories",
               description: "Manage dynamic refund categories (Vitcoin, Cash, S-Coin, etc.).",
               type: "categories_refund",
-              defaultValue: refundConfig.categories,
+              defaultValue: dynamicConf?.categories || refundConfig.categories,
             }
           ] : [],
         };

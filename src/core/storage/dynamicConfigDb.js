@@ -11,34 +11,47 @@ const memoryAuditLogs = [];
 let lastCacheSyncTime = 0;
 const CACHE_TTL_MS = 15000; // 15 seconds TTL between D1 sync checks per isolate
 
+let _tablesEnsured = false;
+
 /**
  * Ensure database tables exist in D1.
  *
  * @param {Object} db Cloudflare D1 binding
  */
 async function ensureTables(db) {
-  if (!db) return;
+  if (!db || _tablesEnsured) return;
   try {
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS bot_dynamic_configs (
-        module_id TEXT PRIMARY KEY,
-        config_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        updated_by TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS bot_config_audits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        user_name TEXT NOT NULL,
-        module_id TEXT NOT NULL,
-        module_name TEXT NOT NULL,
-        action TEXT NOT NULL,
-        key TEXT NOT NULL,
-        old_value TEXT,
-        new_value TEXT
-      );
-    `);
+    if (typeof db.prepare === "function") {
+      await db
+        .prepare(`
+          CREATE TABLE IF NOT EXISTS bot_dynamic_configs (
+            module_id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+          )
+        `)
+        .run();
+
+      await db
+        .prepare(`
+          CREATE TABLE IF NOT EXISTS bot_config_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            module_id TEXT NOT NULL,
+            module_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            key TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT
+          )
+        `)
+        .run();
+
+      _tablesEnsured = true;
+    }
   } catch (err) {
     console.warn("[DynamicConfigDb] Warning ensuring D1 tables:", err?.message || err);
   }

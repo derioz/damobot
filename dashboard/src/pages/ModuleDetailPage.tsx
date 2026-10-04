@@ -80,12 +80,14 @@ export const ModuleDetailPage: React.FC<ModuleDetailPageProps> = ({
     setHasUnsavedChanges(false);
   };
 
-  const handleSave = async () => {
+  const handleSave = async (overrideData?: Record<string, any>) => {
     if (!moduleDef) return;
+    const dataToSave = overrideData || formData;
     setSaving(true);
     try {
-      await onSaveSettings(moduleDef.id, formData);
-      setInitialData(JSON.parse(JSON.stringify(formData)));
+      await onSaveSettings(moduleDef.id, dataToSave);
+      setFormData(dataToSave);
+      setInitialData(JSON.parse(JSON.stringify(dataToSave)));
       setHasUnsavedChanges(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 4000);
@@ -321,6 +323,13 @@ export const ModuleDetailPage: React.FC<ModuleDetailPageProps> = ({
                         <CategoryManager
                           categories={currentValue}
                           onChange={(cats) => handleFieldChange(field.key, cats)}
+                          onSave={async (cats) => {
+                            const updated = { ...formData, [field.key]: cats };
+                            setFormData(updated);
+                            await handleSave(updated);
+                          }}
+                          isSaving={saving}
+                          hasUnsavedChanges={hasUnsavedChanges}
                           maxActiveCategories={24}
                         />
                       </div>
