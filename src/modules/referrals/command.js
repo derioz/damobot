@@ -13,10 +13,9 @@ import {
   createContainer,
   createTextDisplay,
   createSeparator,
-  buildDamoFooter,
 } from "../../shared/components.js";
 import { submitReferralToSheet } from "./sheets.js";
-import { referralConfig, isReferralChannel } from "../../config.js";
+import { referralConfig, isReferralChannel, DAMO_BOT_VERSION } from "../../config.js";
 
 /**
  * Build and send a Components V2 confirmation message to the channel
@@ -43,12 +42,10 @@ async function sendReferralConfirmation({ channelId, referredUserId, referrerId,
       createTextDisplay("### ✅ Referral Logged"),
       createSeparator(),
       createTextDisplay(
-        `**Referred:** <@${referredUserId}>\n**Referred By:** <@${referrerId}>\n**Logged:** ${timestamp}`
+        `**Referred:** <@${referredUserId}> • **Referred By:** <@${referrerId}>\n**Logged:** ${timestamp}`
       ),
       createSeparator(),
-      createTextDisplay("-# This referral has been successfully logged."),
-      createSeparator(1, false),
-      buildDamoFooter(),
+      createTextDisplay(`-# This referral has been successfully logged. • Damo-Bot ${DAMO_BOT_VERSION}`),
     ]);
 
     const res = await sendDiscordChannelMessage({
